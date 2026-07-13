@@ -253,19 +253,17 @@ cd c
 
 ## Known Issues / TODO (Detailed Analysis)
 
-### Issue 1: Conv1d Weight Loading Bug
-**Severity**: P0 — model produces wrong outputs
+### Issue 1: Conv1d Weight Loading Bug ✅ FIXED (2026-07-13)
 **Root Cause**: `qt_load()` flattens 3D tensor [6144, 1, 4] but loads with dimensions [2048, 4], discarding a factor of 3.
-**Fix**: Load conv1d weight via raw st_read as float buffer (no quantization), reshape to [conv_dim, kernel_size] in code.
-**Files**: `c/glm.c` lines 139 (conv1d_w field), 1547 (loading), layer 141 (struct)
-**Estimate**: 2-3 hours
+**Fix Applied**: Added `f32_tensor_load()` helper. Changed `conv1d_w` from `QT` to `float*` with `conv1d_n` element count. Reads BF16→F32 via `st_read_f32()`.
 
-### Issue 2: causal_conv1d Not Applied
-**Severity**: P0 — linear attention recurrence is incorrect without conv1d preprocessing
+### Issue 2: causal_conv1d Not Applied ✅ FIXED (2026-07-13)
 **Root Cause**: `linear_attn_forward` copies input with memcpy, skipping conv1d entirely.
-**Fix**: Apply causal_conv1d to projected QKV tensor after projection, before splitting into Q/K/V. The conv1d operates on the combined tensor as a grouped convolution.
-**Files**: `c/glm.c` lines 1146-1147 (current stub), 817-833 (causal_conv1d function)
-**Estimate**: 4-6 hours
+**Fix Applied**: Now applies grouped causal conv1d to projected QKV tensor:
+1. Project input through `in_proj_qkv` → [conv_dim, BS]
+2. Transpose to [BS, conv_dim, S]
+3. Apply grouped causal conv1d (each of 6144 channels convolved independently with 4-tap kernel)
+4. Transpose back, split into Q, V, K
 
 ### Issue 3: in_proj_qkv Inefficiency
 **Severity**: P1 — 50% wasted compute in projections
