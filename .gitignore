@@ -16,10 +16,12 @@ c/iobench
 c/tok_test
 c/backend_cuda.o
 c/backend_cuda_test
+c/backend_hip.o
 c/tests/test_json
 c/tests/test_st
 c/tests/test_tier
 c/tests/test_grammar
+c/tests/test_gguf
 
 # oracoli tiny generati (make_glm_oracle.py) e dati benchmark scaricati
 c/glm_tiny/
@@ -44,3 +46,5 @@ stats*.txt
 /quant_test.py
 /profile_run.py
 /sweep.py
+# CocoIndex Code (ccc)
+/.cocoindex_code/

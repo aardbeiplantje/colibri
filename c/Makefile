@@ -57,27 +57,26 @@ EXE     =
 endif
 endif
 
-# CUDA=1 adds an opt-in backend for resident tensors. The default build remains
+# HIP=1 adds an opt-in backend for resident tensors. The default build remains
 # pure C and keeps the original zero-dependency runtime.
-CUDA      ?= 0
-CUDA_HOME ?= /usr/local/cuda
-NVCC      ?= $(CUDA_HOME)/bin/nvcc
-CUDA_ARCH ?= native
-NVCCFLAGS ?= -O3 -std=c++17 -arch=$(CUDA_ARCH) -Xcompiler=-Wall,-Wextra
+HIP      ?= 0
+HIP_HOME ?= /opt/rocm
+HIPCC    ?= $(HIP_HOME)/bin/hipcc
+HIPFLAGS ?= -O3 -std=c++17 -Wall -Wextra
 PYTHON    ?= python3
-CUDA_OBJ  =
+HIP_OBJ  =
 TEST_BINS = tests/test_json$(EXE) tests/test_st$(EXE) tests/test_tier$(EXE) tests/test_grammar$(EXE)
-ifeq ($(CUDA),1)
+ifeq ($(HIP),1)
 ifeq ($(UNAME_S),Darwin)
-$(error CUDA=1 is supported only on Linux)
+$(error HIP=1 is supported only on Linux)
 endif
 ifneq ($(IS_WIN),)
-# GPU: stub only in Phase 1 (G0). G1 builds coli_cuda.dll with MSVC+nvcc.
-$(error CUDA=1 on Windows requires G1: build coli_cuda.dll with MSVC+nvcc (see PORT_WINDOWS_PLAN.md §8))
+# GPU: stub only in Phase 1 (G0). G1 builds coli_hip.dll with MSVC+hipcc.
+$(error HIP=1 on Windows requires G1: build coli_hip.dll with MSVC+hipcc (see PORT_WINDOWS_PLAN.md §8))
 endif
-CFLAGS   += -DCOLI_CUDA
-LDFLAGS  += -L$(CUDA_HOME)/lib64 -Wl,-rpath,$(CUDA_HOME)/lib64 -lcudart -lstdc++
-CUDA_OBJ  = backend_cuda.o
+CFLAGS   += -DCOLI_HIP
+LDFLAGS  += -L$(HIP_HOME)/lib -Wl,-rpath,$(HIP_HOME)/lib -lamdhip64 -lstdc++
+HIP_OBJ  = backend_hip.o
 endif
 
 all: glm$(EXE)
@@ -85,17 +84,17 @@ all: glm$(EXE)
 # phony 'glm' → 'glm.exe' on Windows (so 'make glm' and 'coli build' work on every platform)
 glm: glm$(EXE)
 
-glm$(EXE): glm.c st.h json.h tok.h tok_unicode.h compat.h grammar.h $(CUDA_OBJ)
-	$(CC) $(CFLAGS) glm.c $(CUDA_OBJ) -o glm$(EXE) $(LDFLAGS)
+glm$(EXE): glm.c st.h json.h tok.h tok_unicode.h compat.h grammar.h $(HIP_OBJ)
+	$(CC) $(CFLAGS) glm.c $(HIP_OBJ) -o glm$(EXE) $(LDFLAGS)
 
-backend_cuda.o: backend_cuda.cu backend_cuda.h
-	@command -v $(NVCC) >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
-	$(NVCC) $(NVCCFLAGS) -c backend_cuda.cu -o $@
+backend_hip.o: backend_hip.cu backend_hip.h
+	@command -v $(HIPCC) >/dev/null 2>&1 || { echo "hipcc not found: set HIP_HOME or HIPCC" >&2; exit 1; }
+	$(HIPCC) $(HIPFLAGS) -c backend_hip.cu -o $@
 
-cuda-test: backend_cuda.cu backend_cuda.h tests/test_backend_cuda.cu
-	@command -v $(NVCC) >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
-	$(NVCC) $(NVCCFLAGS) backend_cuda.cu tests/test_backend_cuda.cu -o backend_cuda_test$(EXE)
-	./backend_cuda_test$(EXE)
+hip-test: backend_hip.cu backend_hip.h tests/test_backend_hip.cu
+	@command -v $(HIPCC) >/dev/null 2>&1 || { echo "hipcc not found: set HIP_HOME or HIPCC" >&2; exit 1; }
+	$(HIPCC) $(HIPFLAGS) backend_hip.cu tests/test_backend_hip.cu -o backend_hip_test$(EXE)
+	./backend_hip_test$(EXE)
 
 olmoe$(EXE): olmoe.c st.h json.h compat.h
 	$(CC) $(CFLAGS) olmoe.c -o olmoe$(EXE) $(LDFLAGS)
@@ -134,7 +133,7 @@ check:
 	$(MAKE) test
 
 clean:
-	rm -f olmoe$(EXE) glm$(EXE) iobench$(EXE) backend_cuda.o backend_cuda_test$(EXE) $(TEST_BINS)
+	rm -f olmoe$(EXE) glm$(EXE) iobench$(EXE) backend_hip.o backend_hip_test$(EXE) $(TEST_BINS)
 	rm -rf tests/__pycache__
 
-.PHONY: all glm cuda-test portable test-c test-python test check clean
+.PHONY: all glm hip-test portable test-c test-python test check clean

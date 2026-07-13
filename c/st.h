@@ -14,6 +14,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <dirent.h>
+#include <sys/mman.h>
 #include "json.h"
 #include "compat.h"
 
@@ -24,6 +25,7 @@ typedef struct {
     int64_t nbytes;
     int     dtype;     /* 0=BF16 1=F16 2=F32 */
     int64_t numel;
+    void    *mmap_ptr; /* mmap'd region for GPU access (NULL until st_mmap_init) */
 } st_tensor;
 
 typedef struct {
@@ -176,6 +178,49 @@ static int st_has(shards *S, const char *name) { return st_find(S, name) != NULL
 static void st_prefetch(shards *S, const char *name) {
     st_tensor *t = st_find(S, name);
     if (t) posix_fadvise(t->fd, t->off, t->nbytes, POSIX_FADV_WILLNEED);
+}
+
+/* MMAP PATH (UMA): mappa il tensore in memoria condivisa per accesso GPU diretto.
+ * Su Strix Halo (gfx1151), il GPU può camminare le pagine mmap'd del file attraverso
+ * hipHostRegisterMapped + hipHostGetDevicePointer — zero copie.
+ * EN: map the tensor into shared memory for direct GPU access.
+ * On Strix Halo, the GPU walks mmap'd file pages via hipHostRegisterMapped.
+ * Returns the mmap'd pointer on success, NULL on failure.
+ * The caller must munmap later. */
+static void* st_mmap_tensor(shards *S, const char *name) {
+    st_tensor *t = st_find(S, name);
+    if (!t) { fprintf(stderr, "missing tensor: %s\n", name); return NULL; }
+    if (t->mmap_ptr) return t->mmap_ptr;  /* already mapped */
+    t->mmap_ptr = mmap(NULL, t->nbytes, PROT_READ, MAP_SHARED, t->fd, t->off);
+    if (t->mmap_ptr == MAP_FAILED) {
+        perror("mmap tensor");
+        t->mmap_ptr = NULL;
+    }
+    return t->mmap_ptr;
+}
+
+/* MMAP PATH: mappa un sotto-range di un tensore (per expert slicing).
+ * Serve per leggere un solo expert da un tensore [E, ...] senza mappare tutto. */
+static void* st_mmap_slice(shards *S, const char *name, int64_t elem_off, int64_t n_elems) {
+    st_tensor *t = st_find(S, name);
+    if (!t) { fprintf(stderr, "missing tensor: %s\n", name); return NULL; }
+    int esz = (t->dtype == 2) ? 4 : 2;
+    int64_t len = n_elems * esz;
+    int64_t boff = t->off + elem_off * esz;
+    void *ptr = mmap(NULL, len, PROT_READ, MAP_SHARED, t->fd, boff);
+    if (ptr == MAP_FAILED) {
+        perror("mmap slice");
+        return NULL;
+    }
+    return ptr;
+}
+
+/* MMAP PATH: scarta la mappatura di un tensore */
+static void st_unmap_tensor(shards *S, const char *name) {
+    st_tensor *t = st_find(S, name);
+    if (!t || !t->mmap_ptr) return;
+    munmap(t->mmap_ptr, t->nbytes);
+    t->mmap_ptr = NULL;
 }
 
 /* legge un tensore in un buffer float32 fornito dal chiamante (numel float).
