@@ -136,7 +136,8 @@ typedef struct {
     QT in_proj_qkv;                              /* combined QKV projection */
     QT in_proj_z;                                /* Z projection */
     QT in_proj_a, in_proj_b;                     /* A, B projections */
-    QT conv1d_w;                                 /* conv1d kernel weights */
+    float *conv1d_w;                             /* conv1d kernel [conv_dim, K] as f32 */
+    int64_t conv1d_n;                            /* conv1d weight element count */
     float *A_log;                                /* log(A) per head (f32) */
     float *dt_bias;                              /* dt bias (f32) */
     float *ln_w;                                 /* layer norm weight (f32) */
@@ -1135,48 +1136,92 @@ static void linear_attn_forward(Model *m, Layer *l, int layer,
     int nv = c->linear_num_value_heads;
     int kd = c->linear_key_head_dim;
     int vd = c->linear_value_head_dim;
+    int conv_dim = nq*kd + nv*vd + nq*kd;  /* 6144 for Qwen3.5-0.8B */
+    int ck = c->linear_conv_kernel_dim;      /* kernel size (4) */
     int BS = B * S;
 
-    /* Temporary buffers */
-    float *x_proj = falloc((int64_t)BS*D);   /* causal conv1d output (copied from x_in) */
-    float *q_all = falloc((int64_t)BS*nq*kd); /* Q: [BS, nq, kd] */
-    float *v_all = falloc((int64_t)BS*nv*vd); /* V: [BS, nv, vd] */
-    float *k_all = falloc((int64_t)BS*nq*kd); /* K: [BS, nq, kd] */
-    float *z_all = falloc((int64_t)BS*nv*vd); /* Z (gate): [BS, nv, vd] */
-    float *a_all = falloc((int64_t)BS*nq);    /* A (exp decay): [BS, nq] */
-    float *b_all = falloc((int64_t)BS*nq);    /* B gate: [BS, nq] */
-    float *y_all = falloc((int64_t)BS*nv*vd); /* output: [BS, nv, vd] */
-    float *out_proj = falloc((int64_t)BS*D);  /* output projection */
+    /* Temporary buffers
+     * Memory layout convention: [dim, BS] for projection outputs to match matmul_qt.
+     * After conv1d, we transpose to [BS, conv_dim, S] for the convolution. */
+    float *x_proj = falloc((int64_t)BS*D);   /* input features [D, BS] */
+    float *q_all  = falloc((int64_t)BS*nq*kd);  /* Q: [nq*kd, BS] */
+    float *v_all  = falloc((int64_t)BS*nv*vd);  /* V: [nv*vd, BS] */
+    float *k_all  = falloc((int64_t)BS*nq*kd);  /* K: [nq*kd, BS] */
+    float *z_all  = falloc((int64_t)BS*nv*vd);  /* Z gate: [nv*vd, BS] */
+    float *a_all  = falloc((int64_t)BS*nq);     /* A decay: [nq, BS] */
+    float *b_all  = falloc((int64_t)BS*nq);     /* B gate: [nq, BS] */
+    float *y_all  = falloc((int64_t)BS*nv*vd);  /* output: [nv*vd, BS] */
+    float *out_proj = falloc((int64_t)BS*D);    /* out proj result: [D, BS] */
 
-    /* 1) Causal conv1d preprocessing (simple: just copy for now) */
-    memcpy(x_proj, x_in, (int64_t)BS * D * sizeof(float));
+    /* 1) Combined QKV projection: [conv_dim, D] @ [D, BS] -> [conv_dim, BS] */
+    float *qkv_all = falloc((int64_t)BS*conv_dim);
+    matmul_qt(qkv_all, x_in, &l->in_proj_qkv, BS);  /* input is x_in, not x_proj */
 
-    /* 2) Projections
-     * in_proj_qkv: [nq*kd + nv*vd + nq*kd, D] — combined Q+V+K projection
-     * We need to handle this carefully — in the actual model, this is one big matmul
-     * but for now we just do the combined projection and slice. */
-    float *qkv_all = falloc((int64_t)BS*(nq*kd + nv*vd + nq*kd));
-    matmul_qt(qkv_all, x_proj, &l->in_proj_qkv, BS);
-    /* Split: Q = first nq*kd, V = next nv*vd, K = last nq*kd */
+    /* 2) Causal conv1d on the projected QKV tensor.
+     * conv1d weight: [conv_dim, ck] stored as flat f32 array.
+     * Conv is a grouped convolution: each channel convolved independently with kernel.
+     * out[b, c, t] = sum_{k=0}^{K-1} input[b, c, t-k] * weight[c, k]  (causal)
+     *
+     * We transpose qkv from [conv_dim, BS] -> [BS, conv_dim, S] for convolution,
+     * then apply conv1d, then transpose back to [conv_dim, BS] for splitting. */
+    /* Transpose: qkv[c*BS + b*S + t] -> qkv_t[b*S*conv_dim + c*S + t] */
+    float *qkv_t = falloc((int64_t)BS*conv_dim*S);
+    for(int b = 0; b < B; b++){
+        for(int c_dim = 0; c_dim < conv_dim; c_dim++){
+            for(int t = 0; t < S; t++){
+                qkv_t[(int64_t)b*S*conv_dim + (int64_t)c_dim*S + t] =
+                    qkv_all[(int64_t)c_dim*BS + (int64_t)b*S + t];
+            }
+        }
+    }
+
+    /* Apply causal conv1d: grouped convolution with kernel=ck */
+    if(l->conv1d_w && l->conv1d_n > 0){
+        float *qkv_c = falloc((int64_t)BS*conv_dim*S); /* conv output */
+        memset(qkv_c, 0, (int64_t)BS*conv_dim*S * sizeof(float));
+        for(int b = 0; b < B; b++){
+            for(int c_dim = 0; c_dim < conv_dim; c_dim++){
+                const float *wc = l->conv1d_w + (int64_t)c_dim * ck;
+                float *out_c = qkv_c + (int64_t)b*S*conv_dim + (int64_t)c_dim*S;
+                for(int t = 0; t < S; t++){
+                    float acc = 0;
+                    for(int k = 0; k < ck && (t - k) >= 0; k++){
+                        acc += qkv_t[(int64_t)b*S*conv_dim + (int64_t)c_dim*S + (t - k)] * wc[k];
+                    }
+                    out_c[t] = acc;
+                }
+            }
+        }
+        /* Transpose back: [BS, conv_dim, S] -> [conv_dim, BS] */
+        for(int b = 0; b < B; b++){
+            for(int c_dim = 0; c_dim < conv_dim; c_dim++){
+                for(int t = 0; t < S; t++){
+                    qkv_all[(int64_t)c_dim*BS + (int64_t)b*S + t] =
+                        qkv_c[(int64_t)b*S*conv_dim + (int64_t)c_dim*S + t];
+                }
+            }
+        }
+        free(qkv_c);
+    }
+    free(qkv_t);
+
+    /* 3) Split QKV from the convolved tensor:
+     * Q = first nq*kd channels, V = next nv*vd, K = last nq*kd */
     for(int bs = 0; bs < BS; bs++){
         float *qo = q_all + (int64_t)bs*nq*kd;
         float *vo = v_all + (int64_t)bs*nv*vd;
         float *ko = k_all + (int64_t)bs*nq*kd;
-        float *qi = qkv_all + (int64_t)bs*(nq*kd + nv*vd + nq*kd);
+        const float *qi = qkv_all + (int64_t)bs*conv_dim;
         memcpy(qo, qi, (int64_t)nq*kd * sizeof(float));
+        memcpy(vo, qi + (int64_t)nq*kd, (int64_t)nv*vd * sizeof(float));
         memcpy(ko, qi + (int64_t)(nq*kd + nv*vd), (int64_t)nq*kd * sizeof(float));
-        /* V is at position nq*kd */
-        memcpy(vo, qkv_all + (int64_t)bs*(nq*kd + nv*vd + nq*kd), (int64_t)nv*vd * sizeof(float));
     }
-    /* Actually, let's use a simpler approach: the combined projection outputs Q+V+K
-     * We'll split by copying from the right positions */
     free(qkv_all);
-    /* For simplicity, just do the projection once and handle slicing in the recurrence */
 
-    /* Z, A, B projections (from separate weight tensors) */
-    matmul_qt(z_all, x_proj, &l->in_proj_z, BS);    /* [nv*vd, D] -> [nv*vd, BS] */
-    matmul_qt(a_all, x_proj, &l->in_proj_a, BS);    /* [nq, D] -> [nq, BS] */
-    matmul_qt(b_all, x_proj, &l->in_proj_b, BS);    /* [nq, D] -> [nq, BS] */
+    /* 4) Z, A, B projections (from separate weight tensors) */
+    matmul_qt(z_all, x_in, &l->in_proj_z, BS);    /* [nv*vd, D] @ [D, BS] */
+    matmul_qt(a_all, x_in, &l->in_proj_a, BS);    /* [nq, D] @ [D, BS] */
+    matmul_qt(b_all, x_in, &l->in_proj_b, BS);    /* [nq, D] @ [D, BS] */
 
     /* 3) Apply A: exp decay per head
      * a[t,h] = exp(a_proj[t,h] + dt_bias[h]) * B[t,h] */
@@ -1438,6 +1483,11 @@ static float *ld(Model *m, const char *name){   /* tensore 1D f32 residente (nor
     int64_t n=st_numel(&m->S,name); if(n<0){fprintf(stderr,"missing %s\n",name);exit(1);}
     float *p=falloc(n); st_read_f32(&m->S,name,p,0); return p;
 }
+/* carica un tensore f32 arbitrario (es. conv1d weight [C,1,K]) dallo shards */
+static float *f32_tensor_load(Model *m, const char *name, int64_t *out_n){
+    int64_t n=st_numel(&m->S,name); if(n<0){fprintf(stderr,"missing %s\n",name);exit(1);}
+    float *p=falloc(n); st_read_f32(&m->S,name,p,0); if(out_n) *out_n=n; return p;
+}
 
 static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits){
     memset(m,0,sizeof(*m)); m->ebits=ebits; m->dbits=dbits;
@@ -1535,7 +1585,6 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
             int nv = c->linear_num_value_heads;
             int kd = c->linear_key_head_dim;
             int vd = c->linear_value_head_dim;
-            int ck = c->linear_conv_kernel_dim;
             l->in_proj_qkv = qt_load(m, P("linear_attn.in_proj_qkv.weight"),
                                      nq*kd + nv*vd + nq*kd, D, dbits);
             l->in_proj_z = qt_load(m, P("linear_attn.in_proj_z.weight"),
@@ -1544,8 +1593,9 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
                                    nq, D, dbits);
             l->in_proj_b = qt_load(m, P("linear_attn.in_proj_b.weight"),
                                    nq, D, dbits);
-            l->conv1d_w = qt_load(m, P("linear_attn.conv1d.weight"),
-                                  nv*vd, ck, dbits);
+            /* conv1d weight: [6144, 1, 4] = [conv_dim, 1, kernel_size] BF16 tensor.
+             * qt_load only supports 2D, so load as raw f32 buffer instead. */
+            l->conv1d_w = f32_tensor_load(m, P("linear_attn.conv1d.weight"), &l->conv1d_n);
             l->A_log = ld(m, P("linear_attn.A_log"));  /* log(A) per head (f32) */
             l->dt_bias = ld(m, P("linear_attn.dt_bias"));
             l->ln_w = ld(m, P("linear_attn.norm.weight"));
