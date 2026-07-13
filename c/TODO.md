@@ -273,12 +273,9 @@ cd c
 **Files**: `c/glm.c` lines 1158-1175, `c/tools/convert_qwen36_fp4.py`
 **Estimate**: 1h (skip) / 4-6h (fix)
 
-### Issue 4: MTP Layer for Qwen3.5/3.6
-**Severity**: P1 — MTP feature unusable for Qwen models
+### Issue 4: MTP Layer for Qwen3.5/3.6 ✅ FIXED (2026-07-13)
 **Root Cause**: Hardcoded GLM-5.2 tensor names in MTP loading block.
-**Fix**: Conditional loading based on `attn_type`. Qwen3.5 MTP uses: `mtp.fc.weight`, `mtp.layers.0.self_attn.{q,k,v,o}_proj.weight`, `mtp.layers.0.{q,k}_norm.weight`, `mtp.norm.weight`, `mtp.pre_fc_norm_{embedding,hidden}.weight`.
-**Files**: `c/glm.c` lines 1578-1625 (MTP block)
-**Estimate**: 3-4 hours
+**Fix Applied**: Conditional loading based on `attn_type`. Added Qwen3.5 MTP fields to Model struct. Updated `mtp_draft()` and `mtp_absorb()` to use correct tensors.
 
 ### Issue 5: GPU Backend for Linear Attention
 **Severity**: P2 — CPU-only, but recurrence is inherently sequential
@@ -323,13 +320,15 @@ cd c
 3. Memory/RSS profiling
 4. FP4 vs BF16 quality comparison
 
-### P1 Fix — Issue 4: MTP Layer for Qwen3.5 (3-4h)
-**Priority: After integration tests pass** — enable the MTP feature.
+### P1 Fix — Issue 4: MTP Layer for Qwen3.5 ✅ FIXED (2026-07-13)
+**Completed in commit `9551902`**
 
-- Change MTP tensor name resolution to check `attn_type`
-- GLM-5.2 MTP: `eh_proj`, `self_attn.q_a_proj`, `mlp.experts.*` (existing)
-- Qwen3.5 MTP: `mtp.fc.weight`, `mtp.layers.0.self_attn.*_proj`, `mtp.layers.0.mlp.*_proj`
-- Qwen3.5 MTP uses GQA attention + dedicated FC head (not linear attention)
+- Added Qwen3.5 MTP fields to Model struct: `mtp_fc`, `mtp_pre_fc_norm_emb/hid`, etc.
+- Conditional MTP loading based on `attn_type`:
+  * GLM-5.2: MLA tensors, eh_proj, shared_head.norm, MoE routing (existing)
+  * Qwen3.5/3.6: GQA tensors (q_proj,k_proj,v_proj,o_proj), mtp.fc.weight,
+    pre_fc_norm_embedding/hidden, standard MLP (no MoE)
+- Updated `mtp_draft()` and `mtp_absorb()` to use correct tensors based on `attn_type`
 
 ### P2 Fix — Issue 5: GPU Backend (8-12h)
 **Priority: Later** — add HIP GPU kernel for causal_conv1d.
