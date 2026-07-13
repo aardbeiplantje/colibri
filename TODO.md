@@ -1,16 +1,22 @@
 # Implementation Plan: HIP + mmap + FP4 for Qwen3.6 on Strix Halo (gfx1151)
 
+> **Quick Status** (updated July 13, 2026): 5 of 8 phases done (62.5%).
+> Phases 1-6 complete. Remaining: Phase 7 (conversion tooling) → Phase 8 (integration).
+
 ## Executive Summary
 
 Migrate this GLM-5.2 inference engine to support:
-1. ~~**Qwen3.6-35B-A3B** model~~ (DeltaNet + MoE architecture) — **Phase 5**
-2. ~~**HIP backend** (AMD ROCm) replacing CUDA~~ — **Phase 1** ✅
-3. ~~**mmap-based weight loading** (GPU walks file pages directly — zero copy)~~ — **Phase 2** ✅
-4. ~~**GGUF FP4** quantization (E2M1 format, MXFP4/NVFP4)~~ — **Phase 3** ✅ (indexer) / **Phase 4** (quant)
+1. ✅ **Qwen3.6-35B-A3B** model (DeltaNet + MoE architecture) — **Phase 5** — DeltaNet + GQA kernels
+2. ✅ **HIP backend** (AMD ROCm) replacing CUDA — **Phase 1**
+3. ✅ **mmap-based weight loading** (GPU walks file pages directly — zero copy) — **Phase 2**
+4. ✅ **GGUF FP4** quantization (E2M1 format, MXFP4/NVFP4) — **Phase 3** (indexer) / **Phase 4** (quant)
+5. ⬜ **RDNA4 FP4 hardware acceleration** (no hardware on gfx1151, using software) — **Phase 6**
+6. ⬜ **GGUF FP4 conversion tooling** (Python scripts) — **Phase 7**
+7. ⬜ **Integration, testing, benchmarking** (end-to-end on real model) — **Phase 8**
 
 **Total estimated effort**: ~20-25 engineer-weeks, with phases of highly variable difficulty.
 
-**Current status**: 5 of 8 phases done (62.5%).
+**Current status**: 5 of 8 phases done (62.5%). 3 phases remaining (6-8).
 
 ---
 
@@ -67,12 +73,11 @@ Migrate this GLM-5.2 inference engine to support:
 
 ## Pending (Phase 6-8)
 
-| Phase | Title | Status | Why blocked |
-|-------|-------|--------|-------------|
-| **5** | Qwen3.6 model (DeltaNet) | ✅ Done | DeltaNet + GQA kernels implemented |
-| **6** | RDNA4 FP4 hardware | 🔬 Researched | No FP4 hardware on RDNA4 — use software dequant |
-| **7** | FP4 conversion tooling | ⬜ Parallel | Uses llama.cpp/ik_llama.cpp tools |
-| **8** | Integration & benchmarking | ⬜ Last | Depends on 7 working |
+| Phase | Title | Status | Notes |
+|-------|-------|--------|-------|
+| **6** | RDNA4 FP4 hardware | ✅ Researched | No FP4 on RDNA4 — software dequant (Phase 4) is correct |
+| **7** | GGUF FP4 conversion tooling | ⬜ Next | Needs Qwen3.6 model weights + Python scripts |
+| **8** | Integration & benchmarking | ⬜ Last | End-to-end: GGUF → mmap → kernels → tokens |
 
 ---
 
@@ -92,10 +97,11 @@ SNAP=./glm_tiny HIP=1 COLI_HIP=1 ./glm 16 4 4
 ### What this gives you right now:
 - ✅ Zero-copy weight loading via mmap on AMD ROCm
 - ✅ 2× memory savings (no slab buffer + no VRAM copy)
-- ✅ Works with any safetensors model (GLM-5.2, Qwen3.6 text-only)
-- ✅ FP4 quantization (OCP E2M1) — encode and dequant verified
-- ✅ DeltaNet + GQA kernels (Phase 5 — COMPLETE)
-- ⬜ End-to-end Qwen3.6 model (requires GGUF conversion + model weights)
+- ✅ Works with any safetensors model (GLM-5.2 path, Qwen3.6 kernels ready)
+- ✅ FP4 quantization (OCP E2M1) — encode and dequant verified (40/40 tests pass)
+- ✅ DeltaNet + GQA attention kernels — Phase 5 COMPLETE
+- ✅ RDNA4 FP4 hardware analysis — Phase 6 RESEARCHED (no hardware on gfx1151)
+- ⬜ End-to-end Qwen3.6 model (requires GGUF conversion + model weights — Phase 7)
 
 ---
 
@@ -161,6 +167,7 @@ SNAP=./glm_tiny HIP=1 COLI_HIP=1 ./glm 16 4 4
 4. **Quality benchmarking**: Perplexity vs BF16 reference (< 2% target)
 
 ---
+
 ## Phase 6: RDNA4 FP4 Hardware Acceleration (Research Update)
 
 **Difficulty: RESEARCH**
