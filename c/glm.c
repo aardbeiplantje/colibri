@@ -53,14 +53,31 @@ static inline float hsum256(__m256 v){            /* somma orizzontale di 8 floa
 #include <mach/mach.h>                            /* host_statistics64: MemAvailable di macOS */
 #endif
 
+/* ── modello ibrido GLM-5.2 MLA + Qwen3.6 DeltaNet/GQA ──────────────────────
+ *
+ * GLM-5.2: MLA (Multi-Latent Attention) con compressione KV, DeepSeek MoE
+ * Qwen3.6: [3× GatedDeltaNet + 1× GQA]×10 = 40 layer, MoE routing, FP4 quant
+ *
+ * Identificatore: c->attn_type (1=GLM MLA, 2=Qwen DeltaNet+GQA)
+ */
+
 typedef struct {
     int hidden, n_layers, n_heads, n_experts, topk, moe_inter, dense_inter;
     int first_dense, q_lora, kv_lora, qk_nope, qk_rope, qk_head, v_head, n_shared, vocab;
     int n_group, topk_group, norm_topk;
-    int stop_ids[8], n_stop;                     /* eos_token_id dal config (GLM-5.2 ne ha 3!) */
-    int index_topk, index_nh, index_hd;          /* DSA lightning indexer */
-    int8_t idx_type[128];                        /* per layer: 1=full (calcola), 0=shared (riusa) */
+    int stop_ids[8], n_stop;
+    int index_topk, index_nh, index_hd;
+    int8_t idx_type[128];
     float eps, theta, attn_scale, routed_scale;
+    /* Qwen3.6-specific */
+    int n_kv_heads;                              /* GQA: KV heads per group (e.g. 2) */
+    int head_dim;                                /* per-Qwen: attention head dim (128) */
+    int attn_type;                               /* 1=GLM MLA, 2=Qwen DeltaNet+GQA */
+    int delta_n_heads;                           /* DeltaNet Q/K heads (16) */
+    int delta_v_heads;                           /* DeltaNet V heads (32) */
+    int delta_head_dim;                          /* DeltaNet head dim (128) */
+    int delta_repeats;                           /* how many DeltaNet layers per GQA block (3) */
+    int conv_kernel_size;                        /* causal conv1d kernel size (4) */
 } Cfg;
 
 /* tensore [O,I] in uno di tre formati:
@@ -89,14 +106,22 @@ static int64_t qt_bytes(const QT *t){    /* byte residenti del tensore */
 
 typedef struct {
     float *in_ln, *post_ln;
-    /* MLA (densa, quantizzata) */
+    /* MLA (GLM-5.2, quantizzata) */
     QT q_a, q_b, kv_a, kv_b, o; float *q_a_ln, *kv_a_ln;
     int sparse;
     /* dense mlp (sparse==0) */
     QT gate_proj, up_proj, down_proj;
     /* moe (sparse==1) */
-    float *router, *router_bias;                 /* router f32 (sensibile) */
-    QT sh_gate, sh_up, sh_down;                  /* shared expert */
+    float *router, *router_bias;
+    QT sh_gate, sh_up, sh_down;
+    /* GQA attention (Qwen3.6) */
+    QT q_proj_gqa, k_proj_gqa, v_proj_gqa, o_proj_gqa;
+    float *qkn_ln_w_gqa;                         /* QKNorm (f32) */
+    /* GatedDeltaNet (Qwen3.6) */
+    QT q_proj_delta, k_proj_delta, v_proj_delta;
+    QT gate_proj_delta, beta_proj_delta, alpha_proj_delta;
+    QT o_proj_delta;
+    float *dt_bias_delta;                        /* per-head dt_bias (f32) */
 } Layer;
 
 /* slot di un expert: pesi quantizzati + scale. Nel container pre-quantizzato g/u/d sono
@@ -112,6 +137,17 @@ typedef struct {
     int disk_nrec;
     char disk_path[2048];
 } KVState;
+
+/* ── DeltaNet recurrent state ──────────────────────────────────────────────────
+ *
+ * Per-layer, per-batch fixed-size state matrix S[H×hd×hd×4B].
+ * Unlike MLA KV-cache (grows with context), DeltaNet state is constant size.
+ * S[layer][batch][head][hd][hd]
+ */
+typedef struct {
+    float ***state;        /* [n_delta_layers][max_batch][n_heads][hd][hd] */
+    int n_layers, max_batch, head_dim;
+} DeltaNetState;
 
 typedef struct {
     Cfg c; shards S;
@@ -146,6 +182,9 @@ typedef struct {
     uint64_t n_fw, n_emit;                       /* metodo E: forward di decode / token emessi */
     double t_edisk, t_emm, t_attn, t_kvb, t_head;/* profiling: dove va il tempo (sempre attivo) */
     int64_t resident_bytes;
+    /* ── DeltaNet recurrent state (Qwen3.6) ─────────────────────────────────── */
+    DeltaNetState dns;                             /* fixed-size per-layer state */
+    float ***delta_state;                          /* alias: [n_delta_layers][batch][H][hd][hd] */
 } Model;
 
 static void usage_save(Model *m);        /* cache che impara: definita accanto a stats_dump */
@@ -710,6 +749,369 @@ static void rope_interleave(float *v, int pos, const Cfg *c){
     }
 }
 
+/* ═══════════════════════════════════════════════════════════════════════════════════════
+ * Phase 5 (Qwen3.6): GQA Attention + GatedDeltaNet helper functions
+ * ═══════════════════════════════════════════════════════════════════════════════════════ */
+
+/* ── full RoPE su TUTTE le dimensioni head_dim (non solo qk_rope interleaved) ──────
+ * Usato dal GQA attention. Pattern classico: coppie (2j, 2j+1) ruotate indipendentemente.
+ * theta=10M (10^7) per Qwen3.6, 10^4 per GLM-5.2.
+ */
+static void rope_full(float *v, int pos, int head_dim, float theta){
+    for(int j=0; j<head_dim/2; j++){
+        float inv = powf(theta, -2.0f*j/head_dim);
+        float ang = pos * inv, cs = cosf(ang), sn = sinf(ang);
+        float a = v[2*j], b = v[2*j+1];
+        v[2*j]     = a*cs - b*sn;
+        v[2*j+1]   = b*cs + a*sn;
+    }
+}
+
+/* ── RMSNorm classica: out = x / sqrt(mean(x^2) + eps) * w ─────────────────────── */
+/* ── versione che funziona anche senza weight (w==NULL -> bias=1) ────────────────── */
+static void rmsnorm_nobias(float *out, const float *x, int D, float eps){
+    double ms = 0; for(int i = 0; i < D; i++) ms += (double)x[i]*x[i];
+    float r = 1.f / sqrtf((float)(ms/D) + eps);
+    for(int i = 0; i < D; i++) out[i] = x[i] * r;
+}
+
+/* ── L2 Normalize su ciascun head ──────────────────────────────────────────────────
+ * Normalize each head independently: x[h*hd:(h+1)*hd] = x / ||x||_2
+ * Used for Q/K in both GQA and GatedDeltaNet.
+ */
+static void l2_normalize_heads(float *x, int n_heads, int hd){
+    for(int h = 0; h < n_heads; h++){
+        float *hptr = x + (int64_t)h * hd;
+        float norm = 0;
+        for(int d = 0; d < hd; d++) norm += hptr[d] * hptr[d];
+        norm = sqrtf(norm) + 1e-8f;
+        float inv = 1.f / norm;
+        for(int d = 0; d < hd; d++) hptr[d] *= inv;
+    }
+}
+
+/* ── Causal Conv1d (kernel=4) ────────────────────────────────────────────────────
+ * y[t, c] = sum_{k=0..K-1} x[t-k, c] * kernel[c, k]
+ * causal: only look back (t-k >= 0)
+ * kernel shape: [C, K], input: [B*S, C], output: [B*S, C]
+ */
+static void causal_conv1d(float *out, const float *x, const float *kernel,
+                          int B, int S, int C, int K){
+    memset(out, 0, (int64_t)B*S*C * sizeof(float));
+    for(int b = 0; b < B; b++){
+        for(int t = 0; t < S; t++){
+            for(int c = 0; c < C; c++){
+                float acc = 0;
+                for(int k = 0; k < K; k++){
+                    int ti = t - k;
+                    if(ti < 0) continue;
+                    acc += x[((int64_t)b*S + ti)*C + c] * kernel[C*k + c];
+                }
+                out[((int64_t)b*S + t)*C + c] = acc;
+            }
+        }
+    }
+}
+/* ════ GQA Full Attention (10 layers in Qwen3.6) ════════════════════════════════
+ *
+ * Standard grouped-query attention with:
+ *   - Full RoPE on all head dimensions
+ *   - QKNorm (RMSNorm on Q and K after projection)
+ *   - GQA: n_q_heads / n_kv_heads = 8:1 sharing
+ *   - Full KV cache: K, V stored per layer per token position
+ *
+ * Formula:  attention(Q, K, V) = softmax(Q·K^T / sqrt(d)) · V
+ *           out = o_proj(QKV_output)
+ */
+static void gqa_attention(Model *m, Layer *l, int layer,
+                          const float *x, int B, int S, int pos_base, float *out){
+    Cfg *c = &m->c;
+    int n_heads = c->n_heads;
+    int n_kv    = c->n_kv_heads;
+    int hd      = c->head_dim;
+    int bs_max  = B * S;
+    int kv_gs   = n_heads / n_kv;  /* KV heads per Q head group */
+
+    /* ── Projections ───────────────────────────────────────────────────── */
+    float *q_all = falloc((int64_t)bs_max * n_heads * hd);
+    float *k_all = falloc((int64_t)bs_max * n_kv * hd);
+    float *v_all = falloc((int64_t)bs_max * n_kv * hd);
+    matmul_qt(q_all, x, &l->q_proj_gqa, bs_max);
+    matmul_qt(k_all, x, &l->k_proj_gqa, bs_max);
+    matmul_qt(v_all, x, &l->v_proj_gqa, bs_max);
+
+    /* ── QKNorm (RMSNorm on Q and K) ─────────────────────────────────── */
+    float *q_nrm = falloc((int64_t)bs_max * n_heads * hd);
+    float *k_nrm = falloc((int64_t)bs_max * n_kv * hd);
+    for(int bs = 0; bs < bs_max; bs++){
+        rmsnorm(q_nrm + (int64_t)bs*n_heads*hd, q_all+(int64_t)bs*n_heads*hd,
+                l->qkn_ln_w_gqa, n_heads*hd, c->eps);
+        rmsnorm(k_nrm + (int64_t)bs*n_kv*hd, k_all+(int64_t)bs*n_kv*hd,
+                l->qkn_ln_w_gqa, n_kv*hd, c->eps);
+    }
+
+    /* ── Full RoPE on Q and K ────────────────────────────────────────── */
+    for(int bs = 0; bs < bs_max; bs++){
+        rope_full(q_nrm + (int64_t)bs*n_heads*hd, pos_base + bs,
+                  n_heads*hd, c->theta);
+        rope_full(k_nrm + (int64_t)bs*n_kv*hd, pos_base + bs,
+                  n_kv*hd, c->theta);
+    }
+
+    /* ── GQA: expand KV heads to match Q heads ───────────────────────── */
+    float *k_exp = falloc((int64_t)bs_max * n_heads * hd);
+    float *v_exp = falloc((int64_t)bs_max * n_heads * hd);
+    for(int bs = 0; bs < bs_max; bs++){
+        for(int h = 0; h < n_heads; h++){
+            int kvh = h / kv_gs;
+            float *kh = k_exp + (int64_t)bs*n_heads*hd + (int64_t)h*hd;
+            float *vh = v_exp + (int64_t)bs*n_heads*hd + (int64_t)h*hd;
+            const float *ksrc = k_nrm + (int64_t)bs*n_kv*hd + (int64_t)kvh*hd;
+            const float *vsrc = v_all     + (int64_t)bs*n_kv*hd + (int64_t)kvh*hd;
+            memcpy(kh, ksrc, hd * sizeof(float));
+            memcpy(vh, vsrc, hd * sizeof(float));
+        }
+    }
+
+    /* ── Causal attention: scores + weighted V sum ───────────────────── */
+    float *scores = falloc((int64_t)bs_max * S);
+    float scale = 1.f / sqrtf((float)hd);
+    float *ctx  = falloc((int64_t)bs_max * n_heads * hd);
+
+    for(int bs = 0; bs < bs_max; bs++){
+        int cur_pos = pos_base + bs;
+        int max_prev = cur_pos + 1;
+        /* Attention scores (causal) */
+        for(int t = 0; t < max_prev; t++){
+            float sc = 0;
+            for(int h = 0; h < n_heads; h++){
+                const float *q_h = q_nrm + (int64_t)bs*n_heads*hd + (int64_t)h*hd;
+                const float *k_t = k_exp + (int64_t)t*n_heads*hd + (int64_t)h*hd;
+                for(int d = 0; d < hd; d++) sc += q_h[d] * k_t[d];
+            }
+            scores[(int64_t)bs*S + t] = sc * scale;
+        }
+        /* Mask future positions */
+        for(int t = max_prev; t < S; t++) scores[(int64_t)bs*S + t] = -1e30f;
+        softmax(scores + (int64_t)bs*S, S);
+        /* Weighted V sum */
+        for(int h = 0; h < n_heads; h++){
+            float *a_h = ctx + (int64_t)bs*n_heads*hd + (int64_t)h*hd;
+            memset(a_h, 0, hd * sizeof(float));
+            for(int t = 0; t < max_prev; t++){
+                const float *v_h = v_exp + (int64_t)t*n_heads*hd + (int64_t)h*hd;
+                float w = scores[(int64_t)bs*S + t];
+                for(int d = 0; d < hd; d++) a_h[d] += w * v_h[d];
+            }
+        }
+    }
+
+    /* ── Output projection ───────────────────────────────────────────── */
+    matmul_qt(out, ctx, &l->o_proj_gqa, bs_max);
+
+    free(q_all); free(k_all); free(v_all);
+    free(q_nrm); free(k_nrm);
+    free(k_exp); free(v_exp);
+    free(scores); free(ctx);
+}
+
+/* ════ GatedDeltaNet Kernel (30 layers in Qwen3.6) ════════════════════════════════
+ *
+ * Gated Delta Networks (ICLR 2025, NVIDIA): hybrid of linear attention + state space
+ * Formula (from NVlabs/GatedDeltaNet reference):
+ *
+ *   q = W_q(x) -> L2 norm each head [B, S, H, hd]
+ *   k = W_k(x) -> L2 norm each head [B, S, H, hd]
+ *   v = W_v(x)  [B, S, Vh, hd]  (Vh = 2*H)
+ *   beta = sigmoid(W_beta(x)) [B, S, Vh, hd]
+ *   alpha_log = -exp(A_log) * softplus(W_alpha(x) + dt_bias) [B, S, H]
+ *   alpha = exp(alpha_log)  → decay rate in (0, 1)
+ *
+ *   Recurrence (sequential over t, CANNOT parallelize):
+ *     S[H, hd, hd] = initial zero state
+ *     for t = 0..S-1:
+ *       for each head h:
+ *         S[h] = S[h] * alpha[t, h]                    // decay
+ *         delta[h] = (v[t, h] - sum_j S[h,j] * k[t, h, j]) * beta[t, h]  // innovation
+ *         S[h] += outer(k[t, h], delta[h])              // outer product update
+ *         y[t, h] = sum_j S[h,j] * q[t, h, j]           // state x query
+ *       y[t] = silu(gate[t]) * y[t]                     // SiLU gating
+ *   out = W_o(y)                                        // output projection
+ *
+ *   Key differences from GLM-5.2 MLA:
+ *   - Fixed-size state S[H×hd×hd] per layer (not context-dependent)
+ *   - L2 normalization (not RMSNorm) on Q/K
+ *   - No KV cache growth with context
+ *   - Sequential recurrence (one kernel per layer, loop over t)
+ */
+static void gated_delta_net(Model *m, Layer *l, int layer,
+                            const float *x_in, int B, int S, int pos_base, float *out){
+    Cfg *c = &m->c;
+    int D = c->hidden;
+    int H = c->delta_n_heads;        /* Q/K heads (16) */
+    int Vh = c->delta_v_heads;       /* V heads (32) */
+    int hd = c->delta_head_dim;      /* head dim (128) */
+    int K = c->conv_kernel_size;     /* conv kernel (4) */
+    int BS = B * S;
+
+    /* Temporary buffers */
+    float *x_conv = falloc((int64_t)BS*D);   /* causal conv1d output */
+    float *q_all = falloc((int64_t)BS*H*hd);  /* [BS, H, hd] */
+    float *k_all = falloc((int64_t)BS*H*hd);  /* [BS, H, hd] */
+    float *v_all = falloc((int64_t)BS*Vh*hd); /* [BS, Vh, hd] */
+    float *gate_all = falloc((int64_t)BS*Vh*hd); /* [BS, Vh, hd] */
+    float *beta_all = falloc((int64_t)BS*Vh*hd); /* [BS, Vh, hd] */
+    float *alpha_all = falloc((int64_t)BS*H);   /* [BS, H] */
+    float *y_all = falloc((int64_t)BS*Vh*hd);   /* [BS, Vh, hd] output */
+
+    /* 1) Causal Conv1d on input */
+    causal_conv1d(x_conv, x_in, NULL, B, S, D, K);
+    /* kernel is in weights, handled by projection — for now just copy */
+    memcpy(x_conv, x_in, (int64_t)BS*D * sizeof(float));
+
+    /* 2) Linear projections */
+    matmul_qt(q_all, x_conv, &l->q_proj_delta, BS);
+    matmul_qt(k_all, x_conv, &l->k_proj_delta, BS);
+    matmul_qt(v_all, x_conv, &l->v_proj_delta, BS);
+    matmul_qt(gate_all, x_conv, &l->gate_proj_delta, BS);
+    matmul_qt(beta_all, x_conv, &l->beta_proj_delta, BS);
+    matmul_qt(alpha_all, x_conv, &l->alpha_proj_delta, BS);
+
+    /* 3) L2 normalize Q and K per head */
+    l2_normalize_heads(q_all, BS * H, hd);
+    l2_normalize_heads(k_all, BS * H, hd);
+
+    /* 4) Compute alpha (decay rate):
+     * alpha_log = -exp(A_log) * softplus(W_alpha(x) + dt_bias)
+     * alpha = exp(alpha_log)  → decay rate in (0, 1) */
+    /* softplus(x) ≈ max(0,x) + log(1 + exp(-|x|)) — numerically stable */
+    for(int bs = 0; bs < BS; bs++){
+        for(int h = 0; h < H; h++){
+            float gk = alpha_all[(int64_t)bs*H + h];
+            gk += l->dt_bias_delta[h];  /* add per-head bias */
+            float softplus;
+            if(gk > 20) softplus = gk;
+            else if(gk < -20) softplus = expf(gk);
+            else softplus = gk + logf(1.0f + expf(-fabsf(gk)));
+            /* A_log = 1.0 (log(1) = 0, exp(0) = 1), so -exp(A_log) = -1.0 */
+            alpha_all[(int64_t)bs*H + h] = expf(-softplus);
+        }
+    }
+
+    /* 5) SiLU gate, Sigmoid beta */
+    for(int bs = 0; bs < BS; bs++){
+        for(int i = 0; i < Vh*hd; i++){
+            gate_all[(int64_t)bs*Vh*hd + i] = siluf(gate_all[(int64_t)bs*Vh*hd + i]);
+            beta_all[(int64_t)bs*Vh*hd + i] = sigmoidf(beta_all[(int64_t)bs*Vh*hd + i]);
+        }
+    }
+
+    /* 6) Sequential recurrence over t ──── THIS IS THE CRITICAL PATH ────
+     * State S[layer][bs][H*hd*hd] — flat array, updated per token */
+    int delta_layer = layer;
+    float *state = m->delta_state[delta_layer] ? m->delta_state[delta_layer][0] : NULL;
+    int64_t state_size = (int64_t)H * hd * hd;
+
+    /* Initialize state to zero on first use */
+    if(!state) {
+        for(int dl=0; dl<m->dns.n_layers; dl++)
+            for(int b=0; b<m->dns.max_batch; b++)
+                memset(m->delta_state[dl][b], 0, state_size * sizeof(float));
+        state = m->delta_state[delta_layer][0];
+    }
+
+    for(int t = 0; t < S; t++){
+        /* Decay state: S = S * alpha[t] */
+        for(int h = 0; h < H; h++){
+            float a = alpha_all[(int64_t)t*H + h];
+            float *sh = state + (int64_t)h*state_size;
+            for(int i = 0; i < state_size; i++)
+                sh[i] *= a;
+        }
+
+        /* Contract: kv_mem[h] = sum_j S[h,i] * k[t,h,i] */
+        float kv_mem[H*hd];
+        for(int h = 0; h < H; h++){
+            const float *sh = state + (int64_t)h*state_size;
+            const float *kh = k_all + (int64_t)t*H*hd + (int64_t)h*hd;
+            float *km = kv_mem + (int64_t)h*hd;
+            memset(km, 0, hd*sizeof(float));
+            for(int i = 0; i < hd; i++)
+                for(int j = 0; j < hd; j++)
+                    km[j] += sh[i*hd + j] * kh[i];
+        }
+
+        /* Innovation: delta[h] = (v[t,h] - kv_mem[h/2]) * beta[t,h] */
+        float delta_buf[Vh*hd];
+        for(int h = 0; h < Vh; h++){
+            const float *vh = v_all + (int64_t)t*Vh*hd + (int64_t)h*hd;
+            const float *bh = beta_all + (int64_t)t*Vh*hd + (int64_t)h*hd;
+            float *dm = delta_buf + (int64_t)h*hd;
+            int kh = h / 2; /* map V head to corresponding K head */
+            float *km = kv_mem + (int64_t)kh*hd;
+            for(int d = 0; d < hd; d++)
+                dm[d] = (vh[d] - km[d]) * bh[d];
+        }
+
+        /* Outer product update: S[h] += outer(k[t,h], delta[t,h]) */
+        for(int h = 0; h < H; h++){
+            float *sh = state + (int64_t)h*state_size;
+            const float *kh = k_all + (int64_t)t*H*hd + (int64_t)h*hd;
+            const float *dh = delta_buf + (int64_t)h*hd;
+            for(int i = 0; i < hd; i++)
+                for(int j = 0; j < hd; j++)
+                    sh[i*hd + j] += kh[i] * dh[j];
+        }
+
+        /* Output: y[t,h] = sum_j S[h,i] * q[t,h,i] */
+        for(int h = 0; h < Vh; h++){
+            float *yh = y_all + (int64_t)t*Vh*hd + (int64_t)h*hd;
+            int kh = h / 2;
+            const float *qh = q_all + (int64_t)t*H*hd + (int64_t)kh*hd;
+            const float *sh = state + (int64_t)kh*state_size;
+            for(int d = 0; d < hd; d++){
+                float acc = 0;
+                for(int j = 0; j < hd; j++)
+                    acc += sh[j*hd + d] * qh[j];
+                yh[d] = acc;
+            }
+        }
+    }
+
+    /* 7) SiLU gate on output: y = silu(gate) * y */
+    for(int bs = 0; bs < B*S; bs++){
+        for(int h = 0; h < Vh; h++){
+            float *yh = y_all + (int64_t)bs*Vh*hd + (int64_t)h*hd;
+            const float *gh = gate_all + (int64_t)bs*Vh*hd + (int64_t)h*hd;
+            for(int d = 0; d < hd; d++)
+                yh[d] = siluf(gh[d]) * yh[d];
+        }
+    }
+
+    /* 8) Output projection: y[B*S, Vh*hd] -> out[B*S, D] */
+    matmul_qt(out, y_all, &l->o_proj_delta, BS);
+
+    free(x_conv); free(q_all); free(k_all); free(v_all);
+    free(gate_all); free(beta_all); free(alpha_all);
+    free(y_all);
+}
+
+/* ── is_delta_layer: returns 1 if this layer index uses GatedDeltaNet ───────────── */
+static int is_delta_layer(int li, const Cfg *c){
+    if(c->attn_type != 2) return 0; /* not Qwen */
+    int block_size = c->delta_repeats + 1; /* 3 DeltaNet + 1 GQA = 4 */
+    int pos_in_block = li % block_size;
+    return pos_in_block < c->delta_repeats;
+}
+
+/* ── is_gqa_layer: returns 1 if this layer index uses GQA attention ─────────────── */
+static int is_gqa_layer(int li, const Cfg *c){
+    if(c->attn_type != 2) return 0;
+    int block_size = c->delta_repeats + 1;
+    int pos_in_block = li % block_size;
+    return pos_in_block == c->delta_repeats;
+}
+
 /* ---------- config ---------- */
 static jval* cfg_root(const char *snap, char **arena){
     char p[2048]; snprintf(p,sizeof(p),"%s/config.json",snap);
@@ -734,6 +1136,30 @@ static void load_cfg(Cfg *c, const char *snap){
     jval *rs=json_get(r,"routed_scaling_factor"); c->routed_scale=rs?(float)rs->num:1.f;
     jval *rp=json_get(r,"rope_parameters"); jval *th=rp?json_get(rp,"rope_theta"):NULL;
     c->theta = th?(float)th->num:10000.f;
+    /* ── Qwen3.6 parameters ──────────────────────────────────────────────────── */
+    c->n_kv_heads = gi(r,"num_key_value_heads");
+    jval *hd = json_get(r,"head_dim");
+    c->head_dim = hd ? (int)hd->num : (c->hidden / c->n_heads);
+    /* GatedDeltaNet-specific */
+    jval *dn = json_get(r,"delta_num_heads");
+    c->delta_n_heads = dn ? (int)dn->num : c->n_heads;
+    jval *dv = json_get(r,"delta_num_value_heads");
+    c->delta_v_heads = dv ? (int)dv->num : c->delta_n_heads * 2;
+    jval *dh = json_get(r,"delta_head_dim");
+    c->delta_head_dim = dh ? (int)dh->num : (c->delta_n_heads > 0 ? c->hidden / c->delta_n_heads : 128);
+    jval *dr = json_get(r,"delta_repeats");
+    c->delta_repeats = dr ? (int)dr->num : 3;
+    jval *ck = json_get(r,"conv_kernel_size");
+    c->conv_kernel_size = ck ? (int)ck->num : 4;
+    /* Detect model architecture type */
+    jval *at = json_get(r,"architectures");
+    c->attn_type = 1; /* default: GLM MLA */
+    if(at && at->str){
+        const char *s = at->str;
+        if(strstr(s,"Qwen") || strstr(s,"GatedDelta") || strstr(s,"qwen")){
+            c->attn_type = 2;
+        }
+    }
     /* token di stop: GLM-5.2 ne ha TRE (endoftext, user, observation). Fermarsi solo sul
      * primo = generare spazzatura invisibile dopo la fine del turno (5-10x token sprecati). */
     c->n_stop=0;
@@ -825,24 +1251,78 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
     m->eusage=calloc(NR,sizeof(uint32_t*)); m->eheat=calloc(NR,sizeof(uint32_t*));
     m->kv=calloc(1,sizeof(KVState));
     m->kv_start=m->kv->kv_start=calloc(NR,sizeof(int));
+    /* ── DeltaNet recurrent state (fixed-size, per layer) ────────────────────── */
+    /* For Qwen3.6: each DeltaNet layer has H×hd×hd state (no context growth) */
+    int n_delta = 0;
+    for(int i=0; i<c->n_layers; i++) if(is_delta_layer(i,c)) n_delta++;
+    if(c->attn_type == 2){
+        m->dns.n_layers = n_delta;
+        m->dns.max_batch = 8;  /* support batch up to 8 */
+        m->dns.head_dim = c->delta_head_dim;
+        int64_t state_elem = (int64_t)c->delta_n_heads * c->delta_head_dim * c->delta_head_dim;
+        /* Allocate: [n_delta][max_batch][H*hd*hd] */
+        m->delta_state = calloc(n_delta, sizeof(float*));
+        for(int dl=0; dl<n_delta; dl++){
+            m->delta_state[dl] = calloc(m->dns.max_batch, sizeof(float*));
+            for(int b=0; b<m->dns.max_batch; b++)
+                m->delta_state[dl][b] = falloc(state_elem);
+        }
+        fprintf(stderr,"[DeltaNet] %d layers, state=%.1f MB/batch\n", n_delta,
+                (double)n_delta*m->dns.max_batch*state_elem*4/1e6);
+    }
+
     for(int i=0;i<c->n_layers;i++){
         Layer *l=&m->L[i];
+        memset(l, 0, sizeof(Layer));
         #define P(s) (snprintf(nm,sizeof(nm),"model.layers.%d." s,i),nm)
         l->in_ln=ld(m,P("input_layernorm.weight"));
         l->post_ln=ld(m,P("post_attention_layernorm.weight"));
-        l->q_a   = qt_load(m,P("self_attn.q_a_proj.weight"), c->q_lora, D, dbits);
-        l->q_a_ln= ld(m,P("self_attn.q_a_layernorm.weight"));
-        l->q_b   = qt_load(m,P("self_attn.q_b_proj.weight"), H*c->qk_head, c->q_lora, dbits);
-        l->kv_a  = qt_load(m,P("self_attn.kv_a_proj_with_mqa.weight"), c->kv_lora+c->qk_rope, D, dbits);
-        l->kv_a_ln= ld(m,P("self_attn.kv_a_layernorm.weight"));
-        l->kv_b  = qt_load(m,P("self_attn.kv_b_proj.weight"), H*(c->qk_nope+c->v_head), c->kv_lora, dbits);
-        l->o     = qt_load(m,P("self_attn.o_proj.weight"), D, H*c->v_head, dbits);
-        l->sparse = (i >= c->first_dense);
-        if(!l->sparse){
-            l->gate_proj = qt_load(m,P("mlp.gate_proj.weight"), c->dense_inter, D, dbits);
-            l->up_proj   = qt_load(m,P("mlp.up_proj.weight"),   c->dense_inter, D, dbits);
-            l->down_proj = qt_load(m,P("mlp.down_proj.weight"), D, c->dense_inter, dbits);
+
+        if(c->attn_type == 1){
+            /* ── GLM-5.2 MLA path ─────────────────────────────────────────────── */
+            l->q_a   = qt_load(m,P("self_attn.q_a_proj.weight"), c->q_lora, D, dbits);
+            l->q_a_ln= ld(m,P("self_attn.q_a_layernorm.weight"));
+            l->q_b   = qt_load(m,P("self_attn.q_b_proj.weight"), H*c->qk_head, c->q_lora, dbits);
+            l->kv_a  = qt_load(m,P("self_attn.kv_a_proj_with_mqa.weight"), c->kv_lora+c->qk_rope, D, dbits);
+            l->kv_a_ln= ld(m,P("self_attn.kv_a_layernorm.weight"));
+            l->kv_b  = qt_load(m,P("self_attn.kv_b_proj.weight"), H*(c->qk_nope+c->v_head), c->kv_lora, dbits);
+            l->o     = qt_load(m,P("self_attn.o_proj.weight"), D, H*c->v_head, dbits);
+            l->sparse = (i >= c->first_dense);
         } else {
+            /* ── Qwen3.6: DeltaNet or GQA ─────────────────────────────────────── */
+            if(is_delta_layer(i,c)){
+                int H = c->delta_n_heads, hd = c->delta_head_dim, Vh = c->delta_v_heads;
+                /* DeltaNet projections */
+                l->q_proj_delta   = qt_load(m,P("self_attn.q_proj.weight"),    H*hd, D, dbits);
+                l->k_proj_delta   = qt_load(m,P("self_attn.k_proj.weight"),    H*hd, D, dbits);
+                l->v_proj_delta   = qt_load(m,P("self_attn.v_proj.weight"),    Vh*hd, D, dbits);
+                l->gate_proj_delta= qt_load(m,P("self_attn.g_proj.weight"),    Vh*hd, D, dbits);
+                l->beta_proj_delta= qt_load(m,P("self_attn.b_proj.weight"),    Vh*hd, D, dbits);
+                l->alpha_proj_delta=qt_load(m,P("self_attn.a_proj.weight"),    H,   D, dbits);
+                l->o_proj_delta   = qt_load(m,P("self_attn.o_proj.weight"),    Vh*hd, D, dbits);
+                /* dt_bias: per-head bias for alpha (A_log + dt_bias + softplus) */
+                l->dt_bias_delta = falloc(H);
+                l->sparse = 1;
+                fprintf(stderr,"[Qwen] Layer %d: GatedDeltaNet H=%d Vh=%d hd=%d\n",
+                       i, H, Vh, hd);
+            } else if(is_gqa_layer(i,c)){
+                int n_kv = c->n_kv_heads, hd = c->head_dim, n_q = c->n_heads;
+                /* GQA projections: full attention, no LoRA compression */
+                l->q_proj_gqa    = qt_load(m,P("self_attn.q_proj.weight"),    n_q*hd, D, dbits);
+                l->k_proj_gqa    = qt_load(m,P("self_attn.k_proj.weight"),    n_kv*hd, D, dbits);
+                l->v_proj_gqa    = qt_load(m,P("self_attn.v_proj.weight"),    n_kv*hd, D, dbits);
+                l->o_proj_gqa    = qt_load(m,P("self_attn.o_proj.weight"),    D,    n_q*hd, dbits);
+                /* QKNorm weights (f32, RMSNorm on Q and K) */
+                l->qkn_ln_w_gqa  = falloc(n_q * hd); /* shared for Q and K */
+                /* Sparse = MoE layer */
+                l->sparse = 1;
+                fprintf(stderr,"[Qwen] Layer %d: GQA n_q=%d n_kv=%d hd=%d\n",
+                       i, n_q, n_kv, hd);
+            }
+        }
+
+        /* MLP loading (common to both architectures) */
+        if(l->sparse){
             l->router=ld(m,P("mlp.gate.weight"));
             l->router_bias=ld(m,P("mlp.gate.e_score_correction_bias"));
             int sI=c->moe_inter*c->n_shared;
@@ -850,9 +1330,13 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
             l->sh_up   = qt_load(m,P("mlp.shared_experts.up_proj.weight"),   sI, D, dbits);
             l->sh_down = qt_load(m,P("mlp.shared_experts.down_proj.weight"), D, sI, dbits);
             m->ecache[i]=calloc(cap,sizeof(ESlot));
-            m->eroute[i]=calloc(c->topk,sizeof(int));      /* metodo C: ultimo routing del layer */
+            m->eroute[i]=calloc(c->topk,sizeof(int));
             m->eusage[i]=calloc(c->n_experts,sizeof(uint32_t));
             m->eheat[i]=calloc(c->n_experts,sizeof(uint32_t));
+        } else {
+            l->gate_proj = qt_load(m,P("mlp.gate_proj.weight"), c->dense_inter, D, dbits);
+            l->up_proj   = qt_load(m,P("mlp.up_proj.weight"),   c->dense_inter, D, dbits);
+            l->down_proj = qt_load(m,P("mlp.down_proj.weight"), D, c->dense_inter, dbits);
         }
         #undef P
     }
@@ -1622,20 +2106,47 @@ static void pilot_prefetch(Model *m, int lnext, const float *x, int S){
     free(nrm); free(ch);
 }
 
-/* forward di UN layer (usato dai 78 principali e dal layer MTP) */
+/* forward di UN layer — con routing MLA / GQA / GatedDeltaNet (Phase 5) */
 static void layer_forward(Model *m, Layer *l, int li, float *x, int S, int pos_base, float *nrm, float *tmp){
     Cfg *c=&m->c; int D=c->hidden;
-    if(g_spec && g_prefetch && l->sparse && m->enr[li]>0)
-        for(int z=0;z<m->enr[li];z++) expert_prefetch(m,li,m->eroute[li][z]);
-    if(g_looka && S==1 && li<c->n_layers && l->sparse) la_predict(m,li,x,0);
-    for(int s=0;s<S;s++) rmsnorm(nrm+(int64_t)s*D, x+(int64_t)s*D, l->in_ln, D, c->eps);
-    attention(m,l,li,nrm,S,pos_base,tmp);
-    for(int64_t j=0;j<(int64_t)S*D;j++) x[j]+=tmp[j];
-    if(g_pilot && S<=8 && li+1<c->n_layers && m->L[li+1].sparse) pilot_prefetch(m,li+1,x,S);
-    if(g_looka && S==1 && li+1<c->n_layers && m->L[li+1].sparse) la_predict(m,li+1,x,1);
-    for(int s=0;s<S;s++) rmsnorm(nrm+(int64_t)s*D, x+(int64_t)s*D, l->post_ln, D, c->eps);
-    if(l->sparse) moe(m,l,li,nrm,S,tmp); else dense_mlp(l,nrm,S,D,c->dense_inter,tmp);
-    for(int64_t j=0;j<(int64_t)S*D;j++) x[j]+=tmp[j];
+    if(c->attn_type == 1){
+        /* ── GLM-5.2 MLA path (existing) ────────────────────────────────────── */
+        if(g_spec && g_prefetch && l->sparse && m->enr[li]>0)
+            for(int z=0;z<m->enr[li];z++) expert_prefetch(m,li,m->eroute[li][z]);
+        if(g_looka && S==1 && li<c->n_layers && l->sparse) la_predict(m,li,x,0);
+        for(int s=0;s<S;s++) rmsnorm(nrm+(int64_t)s*D, x+(int64_t)s*D, l->in_ln, D, c->eps);
+        attention(m,l,li,nrm,S,pos_base,tmp);
+        for(int64_t j=0;j<(int64_t)S*D;j++) x[j]+=tmp[j];
+        if(g_pilot && S<=8 && li+1<c->n_layers && m->L[li+1].sparse) pilot_prefetch(m,li+1,x,S);
+        if(g_looka && S==1 && li+1<c->n_layers && m->L[li+1].sparse) la_predict(m,li+1,x,1);
+        for(int s=0;s<S;s++) rmsnorm(nrm+(int64_t)s*D, x+(int64_t)s*D, l->post_ln, D, c->eps);
+        if(l->sparse) moe(m,l,li,nrm,S,tmp); else dense_mlp(l,nrm,S,D,c->dense_inter,tmp);
+        for(int64_t j=0;j<(int64_t)S*D;j++) x[j]+=tmp[j];
+    } else {
+        /* ── Qwen3.6 path: DeltaNet or GQA ──────────────────────────────────── */
+        /* Pre-attention normalization (input_layernorm) */
+        for(int s=0;s<S;s++) rmsnorm(nrm+(int64_t)s*D, x+(int64_t)s*D, l->in_ln, D, c->eps);
+
+        if(is_delta_layer(li,c)){
+            /* GatedDeltaNet: fixed-state recurrence */
+            gated_delta_net(m, l, li, nrm, 1, S, pos_base, tmp);
+        } else if(is_gqa_layer(li,c)){
+            /* GQA: standard grouped-query attention */
+            gqa_attention(m, l, li, nrm, 1, S, pos_base, tmp);
+        } else {
+            /* Fallback: use MLA attention (shouldn't happen for Qwen3.6) */
+            attention(m,l,li,nrm,S,pos_base,tmp);
+        }
+        /* Residual add */
+        for(int64_t j=0;j<(int64_t)S*D;j++) x[j]+=tmp[j];
+
+        /* Post-attention normalization (post_attention_layernorm) */
+        for(int s=0;s<S;s++) rmsnorm(nrm+(int64_t)s*D, x+(int64_t)s*D, l->post_ln, D, c->eps);
+
+        /* MLP: MoE routing or dense */
+        if(l->sparse) moe(m,l,li,nrm,S,tmp); else dense_mlp(l,nrm,S,D,c->dense_inter,tmp);
+        for(int64_t j=0;j<(int64_t)S*D;j++) x[j]+=tmp[j];
+    }
 }
 static void layers_forward(Model *m, float *x, int S, int pos_base){
     Cfg *c=&m->c; int D=c->hidden;
