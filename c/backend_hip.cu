@@ -280,7 +280,7 @@ extern "C" void coli_hip_tensor_free(ColiHipTensor *tensor) {
     if (tensor->weights) {
         if (tensor->is_mmap) {
             /* Was registered with hipHostRegisterMapped — unregister instead of free */
-            hipHostUnregister(tensor->host_ptr);
+            (void)hipHostUnregister(tensor->host_ptr);
         } else {
             HIP_CHECK(hipFree(tensor->weights), "weights free");
         }
@@ -289,7 +289,7 @@ extern "C" void coli_hip_tensor_free(ColiHipTensor *tensor) {
     if (tensor->scales) {
         if (tensor->scales_host) {
             /* Scales were also registered — unregister */
-            hipHostUnregister(tensor->scales_host);
+            (void)hipHostUnregister(tensor->scales_host);
             tensor->scales_host = nullptr;
         } else {
             HIP_CHECK(hipFree(tensor->scales), "scales free");
