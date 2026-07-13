@@ -1,5 +1,12 @@
 #include "backend_hip.h"
 
+/* __AMDGCN_WAVEFRONT_SIZE is normally defined by the compiler for AMDGCN targets.
+ * On gfx1151 (Strix Halo / RDNA 4) the ROCm toolchain sometimes omits it,
+ * so we define it explicitly. All AMD GPUs use wavefront=32. */
+#ifndef __AMDGCN_WAVEFRONT_SIZE
+#define __AMDGCN_WAVEFRONT_SIZE 32
+#endif
+
 #include <hip/hip_runtime.h>
 
 #include <cstdio>
