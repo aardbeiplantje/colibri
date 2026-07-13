@@ -192,8 +192,14 @@ typedef struct {
     float **Ic;                                  /* alias KVState: cache indexer [max_t*hd] */
     int *dsa_sel, *dsa_nsel; int dsa_scap;       /* selezione per posizione del batch corrente */
     /* testa MTP (layer n_layers, stile DeepSeek-V3): draft nativi ad alta acceptance */
-    int has_mtp; Layer mtpL; QT eh_proj;
-    float *enorm, *hnorm, *mtp_norm;
+    int has_mtp; Layer mtpL; QT eh_proj;          /* GLM-5.2 MTP tensors */
+    float *enorm, *hnorm, *mtp_norm;              /* GLM-5.2 MTP norms */
+    /* Qwen3.5/3.6 MTP tensors (when attn_type==2) */
+    QT mtp_fc;                                    /* mtp.fc.weight [D, 2*D] */
+    float *mtp_pre_fc_norm_emb;                   /* mtp.pre_fc_norm_embedding.weight */
+    float *mtp_pre_fc_norm_hid;                   /* mtp.pre_fc_norm_hidden.weight */
+    float *mtp_q_norm_w;                          /* mtp.layers.0.self_attn.q_norm.weight */
+    float *mtp_k_norm_w;                          /* mtp.layers.0.self_attn.k_norm.weight */
     float *hlast, *h_all;                        /* hidden pre-norm: ultima pos / tutte le pos batch */
     uint64_t mtp_prop, mtp_acc;                  /* statistica acceptance */
     int **eroute; int *enr;                      /* metodo C: routing dell'ULTIMO token per layer */
@@ -1629,46 +1635,95 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
     {
         /* MTP attiva SOLO se il set e' COMPLETO (i tensori vivono su 3 shard: durante la
          * conversione parziale ne esiste solo una parte). MTP=0 la disabilita comunque. */
-        const char *req[]={"eh_proj.weight","enorm.weight","hnorm.weight","shared_head.norm.weight",
-            "input_layernorm.weight","post_attention_layernorm.weight",
-            "self_attn.q_a_proj.weight","self_attn.q_b_proj.weight","self_attn.kv_a_proj_with_mqa.weight",
-            "self_attn.kv_b_proj.weight","self_attn.o_proj.weight","mlp.gate.weight",
-            "mlp.shared_experts.gate_proj.weight","mlp.shared_experts.down_proj.weight",
-            "mlp.experts.0.gate_proj.weight","mlp.experts.255.down_proj.weight"};
-        char mn[256]; m->has_mtp=1;
-        for(unsigned q=0;q<sizeof(req)/sizeof(req[0]);q++){
-            snprintf(mn,sizeof(mn),"model.layers.%d.%s",c->n_layers,req[q]);
-            if(!st_has(&m->S,mn)){ m->has_mtp=0; break; }
-        }
-        if(getenv("MTP") && atoi(getenv("MTP"))==0) m->has_mtp=0;
-        if(m->has_mtp){
-            int i=c->n_layers; Layer *l=&m->mtpL;
-            #define PM(s) (snprintf(nm,sizeof(nm),"model.layers.%d." s,i),nm)
-            l->in_ln=ld(m,PM("input_layernorm.weight"));
-            l->post_ln=ld(m,PM("post_attention_layernorm.weight"));
-            l->q_a   = qt_load(m,PM("self_attn.q_a_proj.weight"), c->q_lora, D, dbits);
-            l->q_a_ln= ld(m,PM("self_attn.q_a_layernorm.weight"));
-            l->q_b   = qt_load(m,PM("self_attn.q_b_proj.weight"), H*c->qk_head, c->q_lora, dbits);
-            l->kv_a  = qt_load(m,PM("self_attn.kv_a_proj_with_mqa.weight"), c->kv_lora+c->qk_rope, D, dbits);
-            l->kv_a_ln= ld(m,PM("self_attn.kv_a_layernorm.weight"));
-            l->kv_b  = qt_load(m,PM("self_attn.kv_b_proj.weight"), H*(c->qk_nope+c->v_head), c->kv_lora, dbits);
-            l->o     = qt_load(m,PM("self_attn.o_proj.weight"), D, H*c->v_head, dbits);
-            l->sparse=1;
-            l->router=ld(m,PM("mlp.gate.weight"));
-            l->router_bias=ld(m,PM("mlp.gate.e_score_correction_bias"));
-            int sI=c->moe_inter*c->n_shared;
-            l->sh_gate = qt_load(m,PM("mlp.shared_experts.gate_proj.weight"), sI, D, dbits);
-            l->sh_up   = qt_load(m,PM("mlp.shared_experts.up_proj.weight"),   sI, D, dbits);
-            l->sh_down = qt_load(m,PM("mlp.shared_experts.down_proj.weight"), D, sI, dbits);
-            m->eh_proj = qt_load(m,PM("eh_proj.weight"), D, 2*D, dbits);
-            m->enorm=ld(m,PM("enorm.weight")); m->hnorm=ld(m,PM("hnorm.weight"));
-            m->mtp_norm=ld(m,PM("shared_head.norm.weight"));
-            m->ecache[i]=calloc(cap,sizeof(ESlot));
-            m->eroute[i]=calloc(c->topk,sizeof(int));
-            m->eusage[i]=calloc(c->n_experts,sizeof(uint32_t));
-            m->eheat[i]=calloc(c->n_experts,sizeof(uint32_t));
-            m->kv_start[i]=-1;                    /* KV MTP: parte dalla prima posizione di decode */
-            #undef PM
+        if(getenv("MTP") && atoi(getenv("MTP"))==0) { m->has_mtp=0; }
+        else {
+            /* GLM-5.2 MTP: checks for MLA-style tensors at model.layers.{n_layers} */
+            const char *req_glm[]={"eh_proj.weight","enorm.weight","hnorm.weight","shared_head.norm.weight",
+                "input_layernorm.weight","post_attention_layernorm.weight",
+                "self_attn.q_a_proj.weight","self_attn.q_b_proj.weight","self_attn.kv_a_proj_with_mqa.weight",
+                "self_attn.kv_b_proj.weight","self_attn.o_proj.weight","mlp.gate.weight",
+                "mlp.shared_experts.gate_proj.weight","mlp.shared_experts.down_proj.weight",
+                "mlp.experts.0.gate_proj.weight","mlp.experts.255.down_proj.weight"};
+            char mn[256]; m->has_mtp=1;
+            for(unsigned q=0;q<sizeof(req_glm)/sizeof(req_glm[0]);q++){
+                snprintf(mn,sizeof(mn),"model.layers.%d.%s",c->n_layers,req_glm[q]);
+                if(!st_has(&m->S,mn)){ m->has_mtp=0; break; }
+            }
+
+            /* Qwen3.5/3.6 MTP: checks for GQA-style tensors under "mtp" prefix */
+            if(!m->has_mtp){
+                const char *req_qwen[]={"mtp.fc.weight","mtp.norm.weight",
+                    "mtp.pre_fc_norm_embedding.weight","mtp.pre_fc_norm_hidden.weight",
+                    "mtp.layers.0.input_layernorm.weight","mtp.layers.0.post_attention_layernorm.weight",
+                    "mtp.layers.0.self_attn.q_proj.weight","mtp.layers.0.self_attn.k_proj.weight",
+                    "mtp.layers.0.self_attn.v_proj.weight","mtp.layers.0.self_attn.o_proj.weight",
+                    "mtp.layers.0.self_attn.q_norm.weight","mtp.layers.0.self_attn.k_norm.weight",
+                    "mtp.layers.0.mlp.gate_proj.weight","mtp.layers.0.mlp.up_proj.weight",
+                    "mtp.layers.0.mlp.down_proj.weight"};
+                m->has_mtp=1;
+                for(unsigned q=0;q<sizeof(req_qwen)/sizeof(req_qwen[0]);q++){
+                    if(!st_has(&m->S,req_qwen[q])){ m->has_mtp=0; break; }
+                }
+            }
+
+            if(m->has_mtp){
+                int i=c->n_layers; Layer *l=&m->mtpL;
+                if(c->attn_type==2){
+                    /* ── Qwen3.5/3.6 MTP ─────────────────────────────────────── */
+                    /* GQA attention + standard MLP (no MLA, no MoE) */
+                    int nq=c->n_heads, n_kv=c->n_kv_heads, hd=c->head_dim, D=c->hidden;
+                    #define QPM(s) (snprintf(nm,sizeof(nm),"mtp.layers.0." s),nm)
+                    l->in_ln=ld(m,QPM("input_layernorm.weight"));
+                    l->post_ln=ld(m,QPM("post_attention_layernorm.weight"));
+                    /* QKV projections (GQA, no LoRA compression) */
+                    l->q_proj_gqa  = qt_load(m,QPM("self_attn.q_proj.weight"),  nq*hd, D, dbits);
+                    l->k_proj_gqa  = qt_load(m,QPM("self_attn.k_proj.weight"),  n_kv*hd, D, dbits);
+                    l->v_proj_gqa  = qt_load(m,QPM("self_attn.v_proj.weight"),  n_kv*hd, D, dbits);
+                    l->o_proj_gqa  = qt_load(m,QPM("self_attn.o_proj.weight"),  D,    nq*hd, dbits);
+                    l->q_norm_w_gqa = ld(m,QPM("self_attn.q_norm.weight"));
+                    l->k_norm_w_gqa = ld(m,QPM("self_attn.k_norm.weight"));
+                    /* MLP: standard dense (no MoE) */
+                    l->gate_proj = qt_load(m,QPM("mlp.gate_proj.weight"), c->dense_inter, D, dbits);
+                    l->up_proj   = qt_load(m,QPM("mlp.up_proj.weight"),   c->dense_inter, D, dbits);
+                    l->down_proj = qt_load(m,QPM("mlp.down_proj.weight"), D, c->dense_inter, dbits);
+                    /* Projection head + norms */
+                    m->mtp_fc       = qt_load(m,"mtp.fc.weight", D, 2*D, dbits);
+                    m->mtp_pre_fc_norm_emb = ld(m,"mtp.pre_fc_norm_embedding.weight");
+                    m->mtp_pre_fc_norm_hid = ld(m,"mtp.pre_fc_norm_hidden.weight");
+                    /* No shared_head.norm or eh_proj for Qwen3.5 */
+                    #undef QPM
+                    fprintf(stderr,"[MTP Qwen35] Layer %d: GQA nq=%d n_kv=%d hd=%d\n",
+                           i, nq, n_kv, hd);
+                } else {
+                    /* ── GLM-5.2 MTP (existing) ────────────────────────────── */
+                    #define PM(s) (snprintf(nm,sizeof(nm),"model.layers.%d." s,i),nm)
+                    l->in_ln=ld(m,PM("input_layernorm.weight"));
+                    l->post_ln=ld(m,PM("post_attention_layernorm.weight"));
+                    l->q_a   = qt_load(m,PM("self_attn.q_a_proj.weight"), c->q_lora, D, dbits);
+                    l->q_a_ln= ld(m,PM("self_attn.q_a_layernorm.weight"));
+                    l->q_b   = qt_load(m,PM("self_attn.q_b_proj.weight"), H*c->qk_head, c->q_lora, dbits);
+                    l->kv_a  = qt_load(m,PM("self_attn.kv_a_proj_with_mqa.weight"), c->kv_lora+c->qk_rope, D, dbits);
+                    l->kv_a_ln= ld(m,PM("self_attn.kv_a_layernorm.weight"));
+                    l->kv_b  = qt_load(m,PM("self_attn.kv_b_proj.weight"), H*(c->qk_nope+c->v_head), c->kv_lora, dbits);
+                    l->o     = qt_load(m,PM("self_attn.o_proj.weight"), D, H*c->v_head, dbits);
+                    l->sparse=1;
+                    l->router=ld(m,PM("mlp.gate.weight"));
+                    l->router_bias=ld(m,PM("mlp.gate.e_score_correction_bias"));
+                    int sI=c->moe_inter*c->n_shared;
+                    l->sh_gate = qt_load(m,PM("mlp.shared_experts.gate_proj.weight"), sI, D, dbits);
+                    l->sh_up   = qt_load(m,PM("mlp.shared_experts.up_proj.weight"),   sI, D, dbits);
+                    l->sh_down = qt_load(m,PM("mlp.shared_experts.down_proj.weight"), D, sI, dbits);
+                    m->eh_proj = qt_load(m,PM("eh_proj.weight"), D, 2*D, dbits);
+                    m->enorm=ld(m,PM("enorm.weight")); m->hnorm=ld(m,PM("hnorm.weight"));
+                    m->mtp_norm=ld(m,PM("shared_head.norm.weight"));
+                    #undef PM
+                }
+                m->ecache[i]=calloc(cap,sizeof(ESlot));
+                m->eroute[i]=calloc(c->topk,sizeof(int));
+                m->eusage[i]=calloc(c->n_experts,sizeof(uint32_t));
+                m->eheat[i]=calloc(c->n_experts,sizeof(uint32_t));
+                m->kv_start[i]=-1;                    /* KV MTP: parte dalla prima posizione di decode */
+            }
         }
     }
     /* DSA lightning indexer: attivo SOLO se i pesi (conversione --indexer) ci sono per
@@ -2531,15 +2586,19 @@ static int mtp_draft(Model *m, int next_tok, int kv, int G, int *draft){
     memcpy(h, m->hlast, D*sizeof(float));
     int tok=next_tok, n=0;
     int prenorm = getenv("MTP_PRENORM")!=NULL;
+    /* Qwen3.5 MTP uses different norm/weight tensors */
+    float *mtp_emb_nrm = c->attn_type==2 ? m->mtp_pre_fc_norm_emb : m->enorm;
+    float *mtp_hid_nrm = c->attn_type==2 ? m->mtp_pre_fc_norm_hid : m->hnorm;
+    QT *mtp_fc_w = c->attn_type==2 ? &m->mtp_fc : &m->eh_proj;
     for(int g=0; g<G; g++){
         int pos=p+g; if(pos+2>=m->max_t) break;
         embed_row(m, tok, x);
-        rmsnorm(x, x, m->enorm, D, c->eps);
+        rmsnorm(x, x, mtp_emb_nrm, D, c->eps);
         if(g==0 && !prenorm) rmsnorm(h, h, m->final_norm, D, c->eps);  /* h vero: post model.norm */
-        rmsnorm(h, h, m->hnorm, D, c->eps);
+        rmsnorm(h, h, mtp_hid_nrm, D, c->eps);
         if(getenv("MTP_SWAP")){ memcpy(cat, h, D*sizeof(float)); memcpy(cat+D, x, D*sizeof(float)); }
         else { memcpy(cat, x, D*sizeof(float)); memcpy(cat+D, h, D*sizeof(float)); }
-        matmul_qt(hx, cat, &m->eh_proj, 1);
+        matmul_qt(hx, cat, mtp_fc_w, 1);
         double n_eh=0; for(int d=0;d<D;d++) n_eh+=hx[d]*hx[d];
         int dbg = getenv("MTP_DEBUG") && atoi(getenv("MTP_DEBUG"))>=2;
         int t_pre=-1;
@@ -2566,15 +2625,19 @@ static void mtp_absorb(Model *m, const int *next_ids, const float *x, int S, int
     if(m->kv_start[li]<0 || m->kv_start[li]>pos_base) m->kv_start[li]=pos_base;
     float *hx=falloc((int64_t)S*D), *cat=falloc(2*D), *e=falloc(D), *hn=falloc(D), *hf=falloc(D);
     int prenorm = getenv("MTP_PRENORM")!=NULL;
+    /* Qwen3.5 MTP uses different norm/weight tensors */
+    float *mtp_emb_nrm = c->attn_type==2 ? m->mtp_pre_fc_norm_emb : m->enorm;
+    float *mtp_hid_nrm = c->attn_type==2 ? m->mtp_pre_fc_norm_hid : m->hnorm;
+    QT *mtp_fc_w = c->attn_type==2 ? &m->mtp_fc : &m->eh_proj;
     for(int i=0;i<S;i++){
         embed_row(m,next_ids[i],e);
-        rmsnorm(e,e,m->enorm,D,c->eps);
-        if(prenorm) rmsnorm(hn,x+(int64_t)i*D,m->hnorm,D,c->eps);
+        rmsnorm(e,e,mtp_emb_nrm,D,c->eps);
+        if(prenorm) rmsnorm(hn,x+(int64_t)i*D,mtp_hid_nrm,D,c->eps);
         else { rmsnorm(hf,x+(int64_t)i*D,m->final_norm,D,c->eps);   /* vLLM: h POST model.norm */
-               rmsnorm(hn,hf,m->hnorm,D,c->eps); }
+               rmsnorm(hn,hf,mtp_hid_nrm,D,c->eps); }
         if(getenv("MTP_SWAP")){ memcpy(cat,hn,D*sizeof(float)); memcpy(cat+D,e,D*sizeof(float)); }
         else { memcpy(cat,e,D*sizeof(float)); memcpy(cat+D,hn,D*sizeof(float)); }
-        matmul_qt(hx+(int64_t)i*D, cat, &m->eh_proj, 1);
+        matmul_qt(hx+(int64_t)i*D, cat, mtp_fc_w, 1);
     }
     float *nrm=falloc((int64_t)S*D), *tmp=falloc((int64_t)S*D);
     layer_forward(m,&m->mtpL,li,hx,S,pos_base,nrm,tmp);
