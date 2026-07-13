@@ -10,7 +10,7 @@
 | 4 | DSA lightning indexer | ✅ Done |
 | 5 | Qwen3.6 hybrid architecture (DeltaNet + GQA) | ✅ Done |
 | 6 | Config parsing (Qwen3.5/3.6 params, layer_types) | ✅ Done |
-| 7 | Qwen3.5 linear attention kernel + GGUF FP4 tool | ✅ Done |
+| 7 | Qwen3.5 linear attention kernel + GGUF FP4 tool + P0 fixes | ✅ Done |
 | 8 | End-to-end integration, testing, benchmarking | 🔲 Next |
 
 ---
@@ -293,3 +293,55 @@ cd c
 **Fix**: For DeltaNet, make `max_batch` a config parameter or derive from model. For linear attention, batch size flows naturally from caller (no pre-alloc).
 **Files**: `c/glm.c` line ~1426
 **Estimate**: 30 minutes
+
+---
+
+## Prioritized Next Steps (2026-07-13)
+
+### Phase 8.1 — End-to-End Integration Testing (1-2h)
+**Priority: First** — verify the fixed code actually works before investing in optimization.
+
+1. Compile with `make`
+2. Run the Qwen3.5-0.8B model through the binary:
+   ```bash
+   ./glm ../../Qwen3.5-0.8B --prompt "The quick brown fox" --max-tokens 64
+   ```
+3. Check for: tensor loading errors, NaN/inf, token generation quality
+
+### Phase 8.2 — Numerical Accuracy (6-8h)
+**Priority: Second** — validate correctness against reference implementations.
+
+1. **DeltaNet vs. PyTorch**: Compare α decay, recurrence state, output projection
+2. **GQA vs. HuggingFace**: Verify RoPE, softmax, causal mask
+3. **FP4 accuracy**: Measure reconstruction error per tensor type
+
+### Phase 8.3 — Benchmarking (8-12h)
+**Priority: Third** — performance profiling on Strix Halo (gfx1151).
+
+1. Prefill throughput (tokens/sec) for batch sizes 1, 4, 8
+2. Decode latency at context lengths 128, 512, 1024
+3. Memory/RSS profiling
+4. FP4 vs BF16 quality comparison
+
+### P1 Fix — Issue 4: MTP Layer for Qwen3.5 (3-4h)
+**Priority: After integration tests pass** — enable the MTP feature.
+
+- Change MTP tensor name resolution to check `attn_type`
+- GLM-5.2 MTP: `eh_proj`, `self_attn.q_a_proj`, `mlp.experts.*` (existing)
+- Qwen3.5 MTP: `mtp.fc.weight`, `mtp.layers.0.self_attn.*_proj`, `mtp.layers.0.mlp.*_proj`
+- Qwen3.5 MTP uses GQA attention + dedicated FC head (not linear attention)
+
+### P2 Fix — Issue 5: GPU Backend (8-12h)
+**Priority: Later** — add HIP GPU kernel for causal_conv1d.
+
+- Current conv1d is CPU-only in linear_attn_forward
+- The recurrence loop must stay CPU (inherently sequential)
+- GPU kernel for conv1d + state update per time step
+
+### P3 Fix — Batch Size (30min)
+**Priority: Low** — remove hardcoded `max_batch=8` in DeltaNet state allocation.
+
+### Recommendation
+1. **Phase 8.1 first** — run the model to confirm the P0 fixes work
+2. **Phase 8.2 second** — verify numerical accuracy before investing in optimization
+3. **P1 MTP fix third** — enable the MTP feature while running integration tests
