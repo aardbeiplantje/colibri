@@ -68,7 +68,9 @@ typedef struct {
  *   fmt=1 INT8  -> q8 (1 byte/param) + scala per riga
  *   fmt=2 INT4  -> q4 (2 valori per byte, impacchettati) + scala per riga
  * INT4 e' cio' che fa stare la densa residente nei 15 GB (0.5 byte/param). */
-/* fmt: 0 F32, 1 INT8, 2 INT4 (2/byte), 3 INT2 (4/byte). q4 ospita sia int4 che int2 packed. */
+/* fmt: 0 F32, 1 INT8, 2 INT4 (2/byte), 3 INT2 (4/byte), 4 NVFP4 (2/byte, E2M1). q4 ospita
+ * sia int4 che int2 e FP4 — ma la dequant è diversa (controlla fmt). FP4: scala per-riga,
+ * ogni valore 3-bit {sign(1)|exp(2)|mant(1)} → ±(2+mant)·2^(exp-3). */
 typedef struct {
     int fmt; float *qf; int8_t *q8; uint8_t *q4; float *s; int O, I;
 #ifdef COLI_HIP
@@ -81,6 +83,7 @@ static int64_t qt_bytes(const QT *t){    /* byte residenti del tensore */
     if(t->fmt==0) return n*4;
     if(t->fmt==1) return n + (int64_t)t->O*4;
     if(t->fmt==3) return (int64_t)t->O*((t->I+3)/4) + (int64_t)t->O*4;
+    /* fmt==2 (int4) e fmt==4 (FP4): 0.5 byte/param */
     return (int64_t)t->O*((t->I+1)/2) + (int64_t)t->O*4;
 }
 
@@ -298,6 +301,32 @@ static void matmul_i2(float *y, const float *x, const uint8_t *q2, const float *
             for(;i<I;i++){ uint8_t byte=w[i>>2]; int sh=(i&3)*2; a += xs[i]*(float)((int)((byte>>sh)&3)-2); }
             y[(int64_t)s*O+o]=a*sc; } }
 }
+/* y[S,O] = x[S,I] @ W^T con W NVFP4 (E2M1) impacchettato (2 valori/byte) + scala[O].
+ * Ogni valore è 3-bit: {sign(1) | exp(2) | mant(1)}.
+ * Dequant: val==0 ? 0 : (-1)^s * (2+m) * 2^(e-3).
+ * Range: ±{0.125, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0}.
+ * Scale = absmax/1.5 (massimo valore FP4 rappresentabile).
+ */
+static void matmul_fp4(float *y, const float *x, const uint8_t *q4, const float *scale, int S, int I, int O){
+    int rb=(I+1)/2;
+    #pragma omp parallel for schedule(static)
+    for (int o=0;o<O;o++){ const uint8_t *w=q4+(int64_t)o*rb; float sc=scale[o];
+        for (int s=0;s<S;s++){ const float *xs=x+(int64_t)s*I; float a=0;
+            for (int i=0;i<I;i+=2){
+                uint8_t byte=w[i>>1];
+                /* OCP FP4 E2M1 decode: sign=bit3, exp=bits2-1, mant=bit0
+                 * Formula: (1 + mant/2) * 2^(exp-1), bias=1. Subnormal: mant/2. */
+                int v0=byte&0xF, v1=(byte>>4)&0xF;
+                float f0=0, f1=0;
+                if(v0){ int s0=v0&8, e0=(v0>>1)&3, m0=v0&1;
+                    f0=m0?0.5f:(1.0f+0.5f*exp2f((float)(e0-1))); if(s0)f0=-f0; }
+                if(v1){ int s1=v1&8, e1=(v1>>1)&3, m1=v1&1;
+                    f1=m1?0.5f:(1.0f+0.5f*exp2f((float)(e1-1))); if(s1)f1=-f1; }
+                a += xs[i]*f0;
+                if(i+1<I) a += xs[i+1]*f1;
+            }
+            y[(int64_t)s*O+o]=a*sc; } }
+}
 /* ---- KERNEL INTERI (IDOT): attivazioni quantizzate a int8 per riga (absmax/127,
  * stile Q8_0), prodotto scalare INTERO via maddubs/madd AVX2 — niente conversione
  * f32 dei pesi nel ciclo caldo. ~2-3x sui matmul quantizzati; errore aggiunto ~0.3%
@@ -504,6 +533,7 @@ static void matmul_qt(float *y, const float *x, QT *w, int S){
         return;
     }
     if(w->fmt==1) matmul_q(y,x,w->q8,w->s,S,w->I,w->O);
+    else if(w->fmt==4) matmul_fp4(y,x,w->q4,w->s,S,w->I,w->O);  /* FP4 E2M1 */
     else if(w->fmt==3) matmul_i2(y,x,w->q4,w->s,S,w->I,w->O);
     else matmul_i4(y,x,w->q4,w->s,S,w->I,w->O);
 }
@@ -547,6 +577,44 @@ static void pack_int2(const float *w, uint8_t *q2, float *scale, int O, int I, i
         for(int i=0;i<I;i+=4){ uint8_t byte=0;
             for(int k=0;k<4 && i+k<I;k++){ int v=(int)lrintf(wr[i+k]/s); if(v>qmax)v=qmax; if(v<-2)v=-2; byte|=(uint8_t)((v+2)<<(k*2)); }
             qr[i>>2]=byte;
+        }
+    }
+}
+
+/* NVFP4 (E2M1) quantization: pack 2 values per byte.
+ * 3-bit encoding: {sign(1) | exp(2) | mant(1)}
+ *   val = 0         → 0
+ *   val = {s,e,m}   → (-1)^s * (2+m) * 2^(e-3)
+ * Range: ±{0.125, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0}
+ * Scale = absmax / 1.5 (max representable E2M1 value).
+ * Packs same layout as int4 (2 nibbles/byte) but with 3-bit E2M1 encoding.
+ */
+static void pack_fp4(const float *w, uint8_t *q4, float *scale, int O, int I, int bits){
+    /* OCP FP4 E2M1: sign(bit3) | exp(bits2-1) | mant(bit0), bias=1
+     * Formula: (1 + mant/2) * 2^(exp-1). Subnormal: mant/2.
+     * Positive values: 0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0
+     * Negative: 0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0
+     * Max representable = ±6.0. Scale = absmax / 6.0 */
+    (void)bits;
+    int rb=(I+1)/2;
+    #pragma omp parallel for schedule(static)
+    for(int o=0;o<O;o++){ const float *wr=w+(int64_t)o*I;
+        float amax=0;
+        for(int i=0;i<I;i++){ float a=fabsf(wr[i]); if(a>amax)amax=a; }
+        float s=amax/6.0f; if(s<1e-12f)s=1e-12f; scale[o]=s;
+        uint8_t *qr=q4+(int64_t)o*rb;
+        /* Positive and negative values indexed by code */
+        static const float reps[16] = {
+            0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+            0.0f,-0.5f,-1.0f,-1.5f,-2.0f,-3.0f,-4.0f,-6.0f
+        };
+        for(int i=0;i<I;i+=2){
+            int v0=1, v1=1; float best0=6.0f, best1=6.0f;
+            float sv0=wr[i]/s, sv1=i+1<I?wr[i+1]/s:0.0f;
+            float av0=fabsf(sv0), av1=fabsf(sv1);
+            for(int j=1;j<16;j++){ if(fabsf(av0-reps[j])<fabsf(av0-best0)){best0=reps[j];v0=j;} }
+            for(int j=1;j<16;j++){ if(fabsf(av1-reps[j])<fabsf(av1-best1)){best1=reps[j];v1=j;} }
+            qr[i>>1]=(uint8_t)(v0|(v1<<4));
         }
     }
 }
@@ -602,14 +670,16 @@ static void qt_alloc(QT *t, int O, int I, int bits){
     t->O=O; t->I=I; t->qf=NULL; t->q8=NULL; t->q4=NULL; t->s=NULL;
     if(bits>=16){ t->fmt=0; t->qf=falloc((int64_t)O*I); }
     else if(bits>=5 || g_nopack){ t->fmt=1; t->q8=malloc((int64_t)O*I); t->s=falloc(O); }
-    else if(bits>=3){ t->fmt=2; t->q4=malloc((int64_t)O*((I+1)/2)); t->s=falloc(O); }
-    else { t->fmt=3; t->q4=malloc((int64_t)O*((I+3)/4)); t->s=falloc(O); }
+    else if(bits==4){ t->fmt=4; t->q4=malloc((int64_t)O*((I+1)/2)); t->s=falloc(O); }  /* FP4 E2M1 */
+    else if(bits>=3){ t->fmt=2; t->q4=malloc((int64_t)O*((I+1)/2)); t->s=falloc(O); }  /* INT4 */
+    else { t->fmt=3; t->q4=malloc((int64_t)O*((I+3)/4)); t->s=falloc(O); }              /* INT2 */
 }
 static void qt_fill(QT *t, const float *w, int bits){
     if(t->fmt==0) memcpy(t->qf, w, (int64_t)t->O*t->I*sizeof(float));
     else if(t->fmt==1) quantize_rows(w, t->q8, t->s, t->O, t->I, bits);
     else if(t->fmt==3) pack_int2(w, t->q4, t->s, t->O, t->I, bits);
-    else pack_int4(w, t->q4, t->s, t->O, t->I, bits);
+    else if(t->fmt==4) pack_fp4(w, t->q4, t->s, t->O, t->I, bits);  /* FP4 E2M1 */
+    else pack_int4(w, t->q4, t->s, t->O, t->I, bits);                /* INT4 */
 }
 
 static void rmsnorm(float *out, const float *x, const float *w, int D, float eps){
@@ -710,6 +780,8 @@ static void qt_from_disk(Model *m, const char *name, int O, int I, int bits, int
     if(st_has(&m->S,sn)){
         int64_t nb=st_nbytes(&m->S,name);
         int fmt = (nb==(int64_t)O*I)?1 : (nb==(int64_t)O*((I+1)/2))?2 : 3;  /* int8 / int4 / int2 dai byte */
+        /* FP4 detection: bits==4 forces fmt=4 even if byte count matches INT4 */
+        if(bits==4 && nb==(int64_t)O*((I+1)/2)) fmt=4;
         if(fmt==1){ if(t->fmt!=1||!t->q8){ t->fmt=1; t->O=O; t->I=I; t->q8=malloc(nb); t->s=falloc(O); } st_read_raw(&m->S,name,t->q8,drop); }
         else      { if(t->fmt!=fmt||!t->q4){ t->fmt=fmt; t->O=O; t->I=I; t->q4=malloc(nb); t->s=falloc(O); } st_read_raw(&m->S,name,t->q4,drop); }
         st_read_f32(&m->S,sn,t->s,drop);
@@ -882,6 +954,17 @@ static void embed_row(Model *m, int tok, float *x){
     if(e->fmt==0){ memcpy(x, e->qf+(int64_t)tok*D, D*sizeof(float)); return; }
     if(e->fmt==1){ const int8_t *q=e->q8+(int64_t)tok*D; float s=e->s[tok];
         for(int i=0;i<D;i++) x[i]=(float)q[i]*s; return; }
+    if(e->fmt==4){ const uint8_t *q=e->q4+(int64_t)tok*((D+1)/2); float s=e->s[tok];   /* OCP FP4 E2M1 */
+        for(int i=0;i<D;i+=2){ uint8_t byte=q[i>>1];
+            int v0=byte&0xF, v1=(byte>>4)&0xF;  /* 4-bit codes, packed 2/byte */
+            float f0=0, f1=0;
+            if(v0){ int sv=v0&8, ev=(v0>>1)&3, mv=v0&1;
+                f0=mv?0.5f:(1.0f+0.5f*exp2f((float)(ev-1))); if(sv)f0=-f0; }
+            if(v1){ int sv=v1&8, ev=(v1>>1)&3, mv=v1&1;
+                f1=mv?0.5f:(1.0f+0.5f*exp2f((float)(ev-1))); if(sv)f1=-f1; }
+            x[i]=f0*s;
+            if(i+1<D) x[i+1]=f1*s; }
+        return; }
     if(e->fmt==2){ const uint8_t *q=e->q4+(int64_t)tok*((D+1)/2); float s=e->s[tok];   /* int4 */
         for(int i=0;i<D;i+=2){ uint8_t byte=q[i>>1]; x[i]=(float)((int)(byte&0xF)-8)*s;
             if(i+1<D) x[i+1]=(float)((int)(byte>>4)-8)*s; }
@@ -937,7 +1020,8 @@ static void expert_load(Model *m, int layer, int eid, ESlot *s){
             void *smp = st_mmap_tensor(&m->S, qsuf);
             if(!smp){ fprintf(stderr,"mmap scale %s failed\n",qsuf); exit(1); }
             int64_t nb=tw[k]->nbytes;
-            int fmt = (nb==(int64_t)OO[k]*II[k])?1 : (nb==(int64_t)OO[k]*((II[k]+1)/2))?2 : 3;
+            int fmt = (nb==(int64_t)OO[k]*II[k])?1 : (nb==(int64_t)OO[k]*((II[k]+1)/2))?2 : 3;  /* int8/int4/int2 */
+            if(b==4 && nb==(int64_t)OO[k]*((II[k]+1)/2)) fmt=4;  /* FP4: same bytes as INT4 */
             qt[k]->fmt=fmt; qt[k]->O=OO[k]; qt[k]->I=II[k]; qt[k]->qf=NULL;
             qt[k]->q8=(int8_t*)wmp; qt[k]->q4=(uint8_t*)wmp; qt[k]->s=(float*)smp;
         }
@@ -995,7 +1079,8 @@ static void expert_load(Model *m, int layer, int eid, ESlot *s){
     QT *qt[3]={&s->g,&s->u,&s->d}; int OO[3]={I,I,D}, II[3]={D,D,I};
     for(int k=0;k<3;k++){
         int64_t nb=tw[k]->nbytes;
-        int fmt = (nb==(int64_t)OO[k]*II[k])?1 : (nb==(int64_t)OO[k]*((II[k]+1)/2))?2 : 3;
+        int fmt = (nb==(int64_t)OO[k]*II[k])?1 : (nb==(int64_t)OO[k]*((II[k]+1)/2))?2 : 3;  /* int8/int4/int2 */
+        if(b==4 && nb==(int64_t)OO[k]*((II[k]+1)/2)) fmt=4;  /* FP4: same bytes as INT4 */
         qt[k]->fmt=fmt; qt[k]->O=OO[k]; qt[k]->I=II[k]; qt[k]->qf=NULL;
         qt[k]->q8=(int8_t*)(s->slab+pos[k]); qt[k]->q4=s->slab+pos[k]; qt[k]->s=fp[k];
     }
@@ -1112,6 +1197,19 @@ static void qt_addrow(const QT *t, int row, float coef, float *acc){
     if(t->fmt==0){ const float *w=t->qf+(int64_t)row*I; for(int i=0;i<I;i++) acc[i]+=coef*w[i]; return; }
     float c=coef*t->s[row];
     if(t->fmt==1){ const int8_t *w=t->q8+(int64_t)row*I; for(int i=0;i<I;i++) acc[i]+=c*(float)w[i]; return; }
+    if(t->fmt==4){ const uint8_t *w=t->q4+(int64_t)row*((I+1)/2);  /* OCP FP4 E2M1 */
+        for(int i=0;i+1<I;i+=2){ uint8_t b=w[i>>1];
+            int v0=b&0xF, v1=(b>>4)&0xF;  /* 4-bit codes, packed 2/byte */
+            float f0=0, f1=0;
+            if(v0){ int sv=v0&8, ev=(v0>>1)&3, mv=v0&1;
+                f0=mv?0.5f:(1.0f+0.5f*exp2f((float)(ev-1))); if(sv)f0=-f0; }
+            if(v1){ int sv=v1&8, ev=(v1>>1)&3, mv=v1&1;
+                f1=mv?0.5f:(1.0f+0.5f*exp2f((float)(ev-1))); if(sv)f1=-f1; }
+            acc[i]+=c*f0; acc[i+1]+=c*f1; }
+        if(I&1){ uint8_t b=w[I>>1]; int v=b&0xF; float f=0;
+            if(v){ int sv=v&8, ev=(v>>1)&3, mv=v&1;
+                f=mv?0.5f:(1.0f+0.5f*exp2f((float)(ev-1))); if(sv)f=-f; }
+            acc[I-1]+=c*f; } return; }
     if(t->fmt==2){ const uint8_t *w=t->q4+(int64_t)row*((I+1)/2);
         for(int i=0;i+1<I;i+=2){ uint8_t b=w[i>>1]; acc[i]+=c*((int)(b&0xF)-8); acc[i+1]+=c*((int)(b>>4)-8); }
         if(I&1){ uint8_t b=w[I>>1]; acc[I-1]+=c*((int)(b&0xF)-8); } return; }
@@ -1125,9 +1223,19 @@ static void qt_matvec_rows(const QT *t, int r0, int n, const float *x, float *y)
         if(t->fmt==0){ const float *w=t->qf+(int64_t)row*I; for(int i=0;i<I;i++) a+=(double)w[i]*x[i]; }
         else if(t->fmt==1){ const int8_t *w=t->q8+(int64_t)row*I; float s=t->s[row];
             float acc=0; for(int i=0;i<I;i++) acc+=(float)w[i]*x[i]; a=acc*s; }
-        else if(t->fmt==2){ const uint8_t *w=t->q4+(int64_t)row*((I+1)/2); float s=t->s[row]; float acc=0;
-            for(int i=0;i+1<I;i+=2){ uint8_t b=w[i>>1]; acc+=((int)(b&0xF)-8)*x[i]+((int)(b>>4)-8)*x[i+1]; }
-            if(I&1){ uint8_t b=w[I>>1]; acc+=((int)(b&0xF)-8)*x[I-1]; } a=acc*s; }
+        else if(t->fmt==4){ const uint8_t *w=t->q4+(int64_t)row*((I+1)/2); float s=t->s[row]; float acc=0;  /* OCP FP4 E2M1 */
+            for(int i=0;i+1<I;i+=2){ uint8_t b=w[i>>1];
+                int v0=b&0xF, v1=(b>>4)&0xF;  /* 4-bit codes, packed 2/byte */
+                float f0=0, f1=0;
+                if(v0){ int sv=v0&8, ev=(v0>>1)&3, mv=v0&1;
+                    f0=mv?0.5f:(1.0f+0.5f*exp2f((float)(ev-1))); if(sv)f0=-f0; }
+                if(v1){ int sv=v1&8, ev=(v1>>1)&3, mv=v1&1;
+                    f1=mv?0.5f:(1.0f+0.5f*exp2f((float)(ev-1))); if(sv)f1=-f1; }
+                acc+=f0*x[i]+f1*x[i+1]; }
+            if(I&1){ uint8_t b=w[I>>1]; int v=b&0xF; float f=0;
+                if(v){ int sv=v&8, ev=(v>>1)&3, mv=v&1;
+                    f=mv?0.5f:(1.0f+0.5f*exp2f((float)(ev-1))); if(sv)f=-f; }
+                acc+=f*x[I-1]; } a=acc*s; }
         else { const uint8_t *w=t->q4+(int64_t)row*((I+3)/4); float s=t->s[row]; float acc=0;
             for(int i=0;i<I;i++){ uint8_t b=w[i>>2]; acc+=((int)((b>>((i&3)*2))&3)-2)*x[i]; } a=acc*s; }
         y[j]=(float)a;

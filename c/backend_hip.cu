@@ -51,7 +51,19 @@ static size_t row_bytes(int fmt, int I) {
     if (fmt == 1) return (size_t)I;
     if (fmt == 2) return (size_t)(I + 1) / 2;
     if (fmt == 3) return (size_t)(I + 3) / 4;
+    if (fmt == 4) return (size_t)(I + 1) / 2;
     return 0;
+}
+
+/* OCP FP4 E2M1 decode: sign=bit3, exp=bits2-1, mant=bit0
+ * Formula: (1 + mant/2) * 2^(exp-1), bias=1. Subnormal: mant/2. */
+__device__ static float fp4_e2m1_decode(int val) {
+    if (val == 0) return 0.0f;
+    int sign = val & 8;
+    int exp = (val >> 1) & 3;
+    int mant = val & 1;
+    float f = mant ? 0.5f : (1.0f + 0.5f * exp2f((float)(exp - 1)));
+    return sign ? -f : f;
 }
 
 __device__ static float weight_at(const void *weights, int fmt, size_t row, int i) {
@@ -62,6 +74,13 @@ __device__ static float weight_at(const void *weights, int fmt, size_t row, int 
     if (fmt == 2) {
         uint8_t v = q[i >> 1];
         return static_cast<float>(((i & 1) ? (v >> 4) : (v & 15)) - 8);
+    }
+    if (fmt == 4) {
+        /* OCP FP4 E2M1: 4-bit codes, packed 2 per byte */
+        uint8_t v = q[i >> 1];
+        int shift = (i & 1) * 4;
+        int code = (v >> shift) & 0xF;
+        return fp4_e2m1_decode(code);
     }
     uint8_t v = q[i >> 2];
     return static_cast<float>(((v >> ((i & 3) * 2)) & 3) - 2);
