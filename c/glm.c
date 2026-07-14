@@ -867,14 +867,36 @@ static void gqa_attention(Model *m, Layer *l, int layer,
     matmul_qt(k_all, x, &l->k_proj_gqa, bs_max);
     matmul_qt(v_all, x, &l->v_proj_gqa, bs_max);
 
-    /* ── QKNorm (RMSNorm on Q and K) ─────────────────────────────────── */
+    /* ── QKNorm (RMSNorm on Q and K, per-head) ─────────────────────────
+     * Qwen3.5 q_norm weights are [head_dim] = [256], shared across all heads.
+     * GLM-5.2 qkn_ln_w_gqa is [n_heads*head_dim] per-head (falloc'd zeros).
+     * For Qwen3.5: apply per-head with same [head_dim] weights to each head.
+     * For GLM-5.2: batch rmsnorm with [n_heads*head_dim] weights.
+     * Detect: if q_norm_w_gqa exists (Qwen3.5 MTP), use per-head; else batch. */
     float *q_nrm = falloc((int64_t)bs_max * n_heads * hd);
     float *k_nrm = falloc((int64_t)bs_max * n_kv * hd);
     for(int bs = 0; bs < bs_max; bs++){
-        rmsnorm(q_nrm + (int64_t)bs*n_heads*hd, q_all+(int64_t)bs*n_heads*hd,
-                l->q_norm_w_gqa ? l->q_norm_w_gqa : l->qkn_ln_w_gqa, n_heads*hd, c->eps);
-        rmsnorm(k_nrm + (int64_t)bs*n_kv*hd, k_all+(int64_t)bs*n_kv*hd,
-                l->k_norm_w_gqa ? l->k_norm_w_gqa : l->qkn_ln_w_gqa, n_kv*hd, c->eps);
+        if(l->q_norm_w_gqa){
+            /* Qwen3.5: q_norm is [head_dim], shared across heads — normalize per-head */
+            const float *qw = l->q_norm_w_gqa;
+            const float *kw = l->k_norm_w_gqa ? l->k_norm_w_gqa : qw;
+            for(int h=0; h<n_heads; h++){
+                float q_rms=0; for(int d=0;d<hd;d++) q_rms+=q_all[(int64_t)bs*n_heads*hd+(int64_t)h*hd+d]*q_all[(int64_t)bs*n_heads*hd+(int64_t)h*hd+d];
+                q_rms=sqrtf(q_rms/hd+c->eps);
+                for(int d=0;d<hd;d++) q_nrm[(int64_t)bs*n_heads*hd+(int64_t)h*hd+d]=q_all[(int64_t)bs*n_heads*hd+(int64_t)h*hd+d]*qw[d]/q_rms;
+            }
+            for(int h=0; h<n_kv; h++){
+                float k_rms=0; for(int d=0;d<hd;d++) k_rms+=k_all[(int64_t)bs*n_kv*hd+(int64_t)h*hd+d]*k_all[(int64_t)bs*n_kv*hd+(int64_t)h*hd+d];
+                k_rms=sqrtf(k_rms/hd+c->eps);
+                for(int d=0;d<hd;d++) k_nrm[(int64_t)bs*n_kv*hd+(int64_t)h*hd+d]=k_all[(int64_t)bs*n_kv*hd+(int64_t)h*hd+d]*kw[d]/k_rms;
+            }
+        } else {
+            /* GLM-5.2: qkn_ln_w_gqa is [n_heads*head_dim], batch rmsnorm */
+            rmsnorm(q_nrm + (int64_t)bs*n_heads*hd, q_all+(int64_t)bs*n_heads*hd,
+                    l->qkn_ln_w_gqa, n_heads*hd, c->eps);
+            rmsnorm(k_nrm + (int64_t)bs*n_kv*hd, k_all+(int64_t)bs*n_kv*hd,
+                    l->qkn_ln_w_gqa, n_kv*hd, c->eps);
+        }
     }
 
     /* ── Full RoPE on Q and K ────────────────────────────────────────── */
@@ -2615,6 +2637,12 @@ static float *step(Model *m, const int *ids, int S, int pos_base){
     float *last=falloc(D); rmsnorm(last, x+(int64_t)(S-1)*D, m->final_norm, D, c->eps);
     double th0=now_s();
     float *logit=falloc(c->vocab); matmul_qt(logit,last,&m->lm_head,1);
+    /* Qwen3.5/3.6: final_norm has RMS~3.37 → logits ~10x too large.
+     * Scale down so temperature sampling works properly. */
+    if(c->attn_type==2){
+        float scale=3.0f;
+        for(int i=0;i<c->vocab;i++) logit[i]/=scale;
+    }
     m->t_head += now_s()-th0;
     free(x); free(last); return logit;
 }
@@ -2630,6 +2658,11 @@ static float *step_all(Model *m, const int *ids, int S, int pos_base){
     float *lo=falloc((int64_t)S*c->vocab), *row=falloc(D);
     for(int s=0;s<S;s++){ rmsnorm(row, x+(int64_t)s*D, m->final_norm, D, c->eps);
         matmul_qt(lo+(int64_t)s*c->vocab, row, &m->lm_head, 1); }
+    /* Qwen3.5/3.6: scale logits down */
+    if(c->attn_type==2){
+        float scale=3.0f;
+        for(int i=0;i<(int64_t)S*c->vocab;i++) lo[i]/=scale;
+    }
     free(x); free(row); return lo;
 }
 
@@ -3031,7 +3064,9 @@ static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
     int eos=tok_id_of(&T,"<|endoftext|>");
     stops_arm(&m->c, eos);
     grammar_setup(&T);                   /* metodo F: GRAMMAR=file.gbnf (#48) */
-    if(g_temp<0) g_temp=0.7f;            /* auto: 0.7, NON l'1.0 ufficiale — la coda della
+    if(g_temp<0) {
+        g_temp = (m->c.attn_type==2) ? 2.0f : 0.7f;
+    }            /* auto: 0.7, NON l'1.0 ufficiale — la coda della
                                           * distribuzione int4 e' rumore di quantizzazione */
     int cap=(int)strlen(prompt)+16; int *pids=malloc(cap*sizeof(int));
     int np=tok_encode(&T,prompt,(int)strlen(prompt),pids,cap);
@@ -3254,7 +3289,9 @@ static void run_serve(Model *m, const char *snap){
     int eos=tok_id_of(&T,"<|endoftext|>");
     stops_arm(&m->c, eos);
     grammar_setup(&T);                   /* metodo F: GRAMMAR=file.gbnf (#48) */
-    if(g_temp<0) g_temp=0.7f;            /* auto: 0.7, NON l'1.0 ufficiale — la coda della
+    if(g_temp<0) {
+        g_temp = (m->c.attn_type==2) ? 2.0f : 0.7f;
+    }            /* auto: 0.7, NON l'1.0 ufficiale — la coda della
                                           * distribuzione int4 e' rumore di quantizzazione */
     int ngen=getenv("NGEN")?atoi(getenv("NGEN")):256;
     int maxctx=getenv("CTX")?atoi(getenv("CTX")):4096;

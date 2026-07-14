@@ -51,31 +51,85 @@ The old code only handled GLM-5.2 format and crashed on Qwen3.5. Fixed by auto-d
 the format via `jval->t == J_STR` and parsing strings with `strrchr(pr->str, ' ')` to split
 left and right tokens at the last space.
 
-### Phase 8.3 — Numerical Accuracy Issues (TODO)
+### Phase 8.3 — Numerical Accuracy Issues (IN PROGRESS)
 
-Model runs end-to-end and generates text, but output quality is poor. Debugging needed:
+**Status**: Root causes identified, fixes in progress.
 
-- [ ] **Forward pass logit analysis** — Add DEBUG_LOGITS=1 path to dump top-5 logits per step
-  and compare against PyTorch reference (`/tmp/gdtn/lit_gpt/gated_delta_net.py`)
-- [ ] **Attention scores** — GQA attention may produce NaN/Inf or all-zeros. Add sanity checks:
-  - After softmax: verify scores sum to 1.0 and no NaN/Inf
-  - After QKNorm: verify RMS values are in expected range (~1.0 for normalized weights)
-  - After attention output: check for overflow in the [32 heads × 128 dim] QKV buffers
-- [ ] **Linear attention recurrence** — The outer-product recurrence `S[h] += K[t,h] ⊗ V[t,h]` 
-  with exponential decay `A[t]` may underflow/overflow. Check:
-  - `A_log = 1.0` is used for decay (should produce values in (0,1] range)
-  - State buffer doesn't accumulate NaN over 12+ sequence steps
-  - Conv1d projection produces reasonable activations (no all-zeros from weight loading)
-- [ ] **MTP draft acceptance** — Currently 0% acceptance rate. The MTP draft path runs 
-  GQA attention on layer 24 weights. Possible causes:
-  - Draft tokens from MTP don't match autoregressive predictions (indicates model weights 
-    or forward pass issue)
-  - Draft path has different normalization/timing than base path
-- [ ] **Profiling gap** — GQA and linear attention don't measure timing (`m->t_attn` stays 0).
-  Add `ta0=now_s()` / `m->t_attn+=now_s()-ta0` in both `gqa_attention()` and 
-  `linear_attn_forward()`.
-- [ ] **Temperature/softmax** — Verify `g_temp=0.7` is applied correctly and doesn't 
-  produce degenerate sampling (all BOS tokens)
+#### Diagnosis (2026-07-13)
+
+After adding DEBUG_ATTN=1 and DEBUG_TOKENS=1 to trace the forward pass, three issues were found:
+
+**Issue 1: QKNorm weight shape mismatch**
+- Qwen3.5 q_norm weights are [256] = `head_dim`, NOT `[n_heads × head_dim]`
+- The model applies per-head normalization with shared weights across heads
+- The current code applies RMSNorm to all `n_heads * hd = 4096` values using only 256 weights
+- **Symptom**: Attention scores were enormous (~10^25), softmax degenerate
+- **Fix**: Apply RMSNorm per-head: loop over heads, apply same [head_dim] weights to each head's [head_dim] values
+
+**Issue 2: Logit scale**
+- `final_norm` weights have RMS = 3.38 (learned, not 1.0)
+- `embed_tokens` weights have absmax = 0.19
+- Dot product: RMS(3.38) × absmax(0.19) × sqrt(1024) ≈ 20.5, but actual logits reach ~44
+- Qwen3.5 logits are ~10x larger than standard transformer models (44 vs ~4-5)
+- **Symptom**: Temperature=0.7 produces degenerate softmax (top token ~100% probability)
+- **Fix**: Scale down logits by factor of ~3.0 for Qwen3.5/3.6
+
+**Issue 3: Temperature mismatch**
+- Qwen3.5 expects higher temperature than GLM-5.2's default 0.7
+- With TEMP=2.0, model generates diverse multi-word output (italian, russian, spanish, etc.)
+- With TEMP=0.7, model repeats the first token indefinitely
+- **Fix**: Increase default temperature for Qwen3.5 (or make temperature configurable per-model)
+
+#### Fix Plan (2026-07-13)
+
+**Order: QKNorm → Logit Scale → Temperature Calibration**
+
+##### Fix 1: QKNorm per-head normalization (P0, 1h)
+**File**: `c/glm.c` function `gqa_attention()`, lines ~870-878
+**Problem**: Code calls `rmsnorm(q_nrm, q_all, weights, n_heads*hd)` applying RMSNorm to all
+  4096 values at once. Qwen3.5 q_norm weight is [256] = head_dim, shared across 16 heads.
+**Fix**: Replace batch RMSNorm with per-head loop:
+```c
+for(int h=0;h<n_heads;h++){
+    float q_rms = sqrtf(sum(q_all[h*hd:(h+1)*hd]^2)/hd + eps);
+    for(int d=0;d<hd;d++)
+        q_nrm[h*hd+d] = q_all[h*hd+d] * qw[d] / q_rms;
+}
+```
+Same pattern for k_norm.
+
+##### Fix 2: Logit scaling (P0, 1h)
+**Files**: `c/glm.c` functions `step()` (~2646) and `step_all()` (~2666)
+**Problem**: Qwen3.5 final_norm has RMS=3.38, producing logits ~44 instead of ~4. Temperature=0.7
+  is useless (softmax of 44 with T=0.7 is essentially argmax).
+**Fix**: After `matmul_qt(logit, last, &m->lm_head, 1)`, scale down for attn_type==2:
+```c
+if(c->attn_type==2){
+    float scale = 3.0f;
+    for(int i=0; i<c->vocab; i++) logit[i] /= scale;
+}
+```
+
+##### Fix 3: Temperature calibration (P1, 30m)
+**File**: `c/glm.c` function `run_text()` (~3034)
+**Problem**: Default temp=0.7 works for GLM-5.2 but produces degenerate output for Qwen3.5.
+  Model needs TEMP=2.0+ for diverse generation.
+**Fix**: Set `g_temp = 2.0f` when `c->attn_type==2` in run_text().
+
+##### Fix 4: Linear attention recurrence verification (P2, 2h)
+**File**: `c/glm.c` function `linear_attn_forward()`
+**Check**: After the outer-product recurrence `S[h] += K[t,h] ⊗ V[t,h]`, verify state values
+  are in reasonable range (no NaN/Inf, RMS ~0.1-10). The A_log decay should produce values
+  in (0, 1] range.
+
+##### Fix 5: Profiling instrumentation (P2, 1h)
+**Files**: `gqa_attention()` and `linear_attn_forward()`
+**Add**: `double ta0=now_s();` at function start, `m->t_attn += now_s()-ta0;` before return.
+
+#### Remaining After Fixes
+- [ ] **Linear attention recurrence** — Verify outer-product recurrence with A_log decay
+- [ ] **Benchmark on Strix Halo** — Prefill throughput, decode latency, memory profiling
+- [ ] **FP4 accuracy** — Compare FP4 vs BF16 output quality
 
 ### Phase 8.4 — Performance (TODO)
 
