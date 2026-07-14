@@ -2871,7 +2871,7 @@ static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *lo
         }
         if(!g && g_draft>0){
             /* auto-off adattivo: draft che non vengono mai accettati = solo tassa disco */
-            if(m->has_mtp && m->mtp_prop>=24 && m->mtp_acc*10 < m->mtp_prop){
+            if(m->has_mtp && m->mtp_prop>=4 && m->mtp_acc==0 && m->mtp_prop>4){
                 g_draft=0;
                 fprintf(stderr,"[MTP] %.0f%% acceptance after %llu proposals: drafts disabled\n",
                     100.0*m->mtp_acc/m->mtp_prop, (unsigned long long)m->mtp_prop);
