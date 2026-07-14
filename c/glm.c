@@ -139,7 +139,7 @@ typedef struct {
     QT in_proj_z;                                /* Z projection */
     QT in_proj_a, in_proj_b;                     /* A, B projections */
     float *conv1d_w;                             /* conv1d kernel [conv_dim, K] as f32 */
-    int64_t conv1d_n;                            /* conv1d weight element count */
+    long conv1d_n;                            /* conv1d weight element count */
     float *A_log;                                /* log(A) per head (f32) */
     float *dt_bias;                              /* dt bias (f32) */
     float *ln_w;                                 /* layer norm weight (f32) */
@@ -1183,6 +1183,13 @@ static void linear_attn_forward(Model *m, Layer *l, int layer,
     /* 1) Combined QKV projection: [conv_dim, D] @ [D, BS] -> [conv_dim, BS] */
     float *qkv_all = falloc((int64_t)BS*conv_dim);
     matmul_qt(qkv_all, x_in, &l->in_proj_qkv, BS);  /* input is x_in, not x_proj */
+    if(getenv("DEBUG_LINEAR")){
+        float rms_in=0; for(int i=0;i<D;i++) rms_in+=x_in[i]*x_in[i];
+        rms_in=sqrtf(rms_in/D);
+        float rms_qkv=0; for(int i=0;i<conv_dim;i++) rms_qkv+=qkv_all[i]*qkv_all[i];
+        rms_qkv=sqrtf(rms_qkv/conv_dim);
+        fprintf(stderr,"[LIN] L%d: in_rms=%.4f qkv_rms=%.4f conv_dim=%d\n",layer,rms_in,rms_qkv,conv_dim);
+    }
 
     /* 2) Causal conv1d on the projected QKV tensor.
      * conv1d weight: [conv_dim, ck] stored as flat f32 array.
@@ -1203,6 +1210,9 @@ static void linear_attn_forward(Model *m, Layer *l, int layer,
     }
 
     /* Apply causal conv1d: grouped convolution with kernel=ck */
+    if(getenv("DEBUG_LINEAR")){
+        fprintf(stderr,"[LIN] L%d: conv1d_w=%p conv1d_n=%ld\n",layer,(void*)l->conv1d_w,l->conv1d_n);
+    }
     if(l->conv1d_w && l->conv1d_n > 0){
         float *qkv_c = falloc((int64_t)BS*conv_dim*S); /* conv output */
         memset(qkv_c, 0, (int64_t)BS*conv_dim*S * sizeof(float));
@@ -1245,12 +1255,18 @@ static void linear_attn_forward(Model *m, Layer *l, int layer,
 
     /* L2 normalize Q and K per head (like fla.LinearAttention).
      * ln_w [128] is per-dimension weight applied after L2 norm. */
+    if(getenv("DEBUG_LINEAR")){
+        float rms_q=0; for(int i=0;i<nq*kd;i++) rms_q+=q_all[i]*q_all[i];
+        fprintf(stderr,"[LIN] L%d: pre_l2_q_rms=%.4f ln_w=%p\n",layer,sqrtf(rms_q/(nq*kd)),(void*)l->ln_w);
+    }
     if(l->ln_w){
         for(int bs = 0; bs < BS; bs++){
             for(int h = 0; h < nq; h++){
                 float *qh = q_all + (int64_t)bs*nq*kd + (int64_t)h*kd;
                 float l2=0; for(int d=0;d<kd;d++) l2 += qh[d]*qh[d];
                 float inv_l2 = (l2 > 0) ? 1.0f/sqrtf(l2+1e-6) : 0; /* L2 norm = sqrt(sum x^2) */
+                if(getenv("DEBUG_LINEAR") && bs==0 && h==0)
+                    fprintf(stderr,"[LIN] L%d: q_l2=%.4f inv_l2=%.4f\n",layer,sqrtf(l2),inv_l2);
                 for(int d=0;d<kd;d++) qh[d] = qh[d] * inv_l2 * l->ln_w[d];
             }
             for(int h = 0; h < nq; h++){
@@ -1266,6 +1282,10 @@ static void linear_attn_forward(Model *m, Layer *l, int layer,
     matmul_qt(z_all, x_in, &l->in_proj_z, BS);    /* [nv*vd, D] @ [D, BS] */
     matmul_qt(a_all, x_in, &l->in_proj_a, BS);    /* [nq, D] @ [D, BS] */
     matmul_qt(b_all, x_in, &l->in_proj_b, BS);    /* [nq, D] @ [D, BS] */
+    if(getenv("DEBUG_LINEAR")){
+        float rms_z=0; for(int i=0;i<nv*vd;i++) rms_z+=z_all[i]*z_all[i];
+        fprintf(stderr,"[LIN] L%d: z_rms=%.4f a_rms=%.4f b_rms=%.4f\n",layer,sqrtf(rms_z/(nv*vd)),a_all[0],b_all[0]);
+    }
 
     /* 3) Apply A: exp decay per head
      * a[t,h] = exp(a_proj[t,h] + dt_bias[h]) * B[t,h] */
@@ -1290,6 +1310,12 @@ static void linear_attn_forward(Model *m, Layer *l, int layer,
 
     for(int t = 0; t < S; t++){
         /* Update state: S[h] = S[h] * a[t,h] + outer(K[t,h], V[t,h]) */
+        if(getenv("DEBUG_LINEAR") && t==0){
+            float rms_k=0; for(int i=0;i<nq*kd;i++) rms_k+=k_all[i]*k_all[i];
+            float rms_v=0; for(int i=0;i<nv*vd;i++) rms_v+=v_all[i]*v_all[i];
+            fprintf(stderr,"[LIN] L%d: t=0 k_rms=%.4f v_rms=%.4f\n",layer,sqrtf(rms_k/(nq*kd)),sqrtf(rms_v/(nv*vd)));
+            fprintf(stderr,"[LIN] L%d: a_all[0]=%.4f a_all[1]=%.4f\n",layer,a_all[0],a_all[1]);
+        }
         for(int b = 0; b < B; b++){
             int64_t b_off = (int64_t)b * state_size;
             for(int h = 0; h < nq; h++){
@@ -1303,6 +1329,9 @@ static void linear_attn_forward(Model *m, Layer *l, int layer,
                 const float *vv = v_all + (int64_t)(t*B+b)*nv*vd;
                 int vh = h * vd / nq; /* map K head to V head */
                 if(vh >= nv) vh = nv - 1;
+                if(getenv("DEBUG_LINEAR") && t==0 && h==0){
+                    fprintf(stderr,"[LIN] L%d: h=0 vh=%d a_val=%.4f\n",layer,vh,a_val);
+                }
                 for(int i = 0; i < kd; i++)
                     for(int j = 0; j < vd; j++)
                         state[b_off + h_off + i*vd + j] += kv[i] * vv[(int64_t)vh*vd + j];
@@ -1312,6 +1341,10 @@ static void linear_attn_forward(Model *m, Layer *l, int layer,
         /* Compute output: y[t,b,h,j] = sum_i q[t,b,h,i] * S[t,b,h,i,j]
          * Reference: einsum('bhd,bhdm->bhm', q, S)
          * Each head h maps to output head h (1:1). Output shape [nv, vd]. */
+        if(getenv("DEBUG_LINEAR") && t==0){
+            float rms_state=0; for(int i=0;i<state_size;i++) rms_state+=state[i]*state[i];
+            fprintf(stderr,"[LIN] L%d: t=0 state_rms=%.4f\n",layer,sqrtf(rms_state/state_size));
+        }
         for(int b = 0; b < B; b++){
             int64_t b_off = (int64_t)b * state_size;
             for(int h = 0; h < nv; h++){
@@ -1340,8 +1373,21 @@ static void linear_attn_forward(Model *m, Layer *l, int layer,
     }
 
     /* 6) Output projection: y[B*S, nv*vd] -> out[B*S, D] */
+    if(getenv("DEBUG_LINEAR")){
+        float rms_y=0; for(int i=0;i<nv*vd;i++) rms_y+=y_all[i]*y_all[i];
+        fprintf(stderr,"[LIN] L%d: pre_out_y_rms=%.4f\n",layer,sqrtf(rms_y/(nv*vd)));
+    }
     matmul_qt(out_proj, y_all, &l->o_proj_delta, BS);
+    if(getenv("DEBUG_LINEAR")){
+        float rms_out=0; for(int i=0;i<D;i++) rms_out+=out_proj[i]*out_proj[i];
+        fprintf(stderr,"[LIN] L%d: post_out_rms=%.4f\n",layer,sqrtf(rms_out/D));
+    }
     memcpy(out, out_proj, (int64_t)BS * D * sizeof(float));
+    if(getenv("DEBUG_LINEAR")){
+        float rms=0; for(int i=0;i<D;i++) rms+=out[i]*out[i];
+        rms=sqrtf(rms/D);
+        fprintf(stderr,"[LIN] L%d: out_rms=%.4f\n",layer,rms);
+    }
 
 }
 
@@ -2655,8 +2701,23 @@ static float *step(Model *m, const int *ids, int S, int pos_base){
     if(m->hlast) memcpy(m->hlast, x+(int64_t)(S-1)*D, D*sizeof(float));
     if(m->has_mtp && S>=2 && g_draft>0) mtp_absorb(m, ids+1, x, S-1, pos_base);
     float *last=falloc(D); rmsnorm(last, x+(int64_t)(S-1)*D, m->final_norm, D, c->eps);
+    if(getenv("DEBUG_LOGITS")){
+        float rms_last=0; for(int i=0;i<D;i++) rms_last+=last[i]*last[i];
+        rms_last=sqrtf(rms_last/D);
+        float rms_ln=0; for(int i=0;i<D;i++) rms_ln+=m->final_norm[i]*m->final_norm[i];
+        rms_ln=sqrtf(rms_ln/D);
+        fprintf(stderr,"[LOGITS] last_rms=%.4f final_norm_rms=%.4f\n",rms_last,rms_ln);
+    }
     double th0=now_s();
     float *logit=falloc(c->vocab); matmul_qt(logit,last,&m->lm_head,1);
+    if(getenv("DEBUG_LOGITS")){
+        /* Check lm_head stats */
+        float absmax_lh=0; int64_t lh_n=(int64_t)c->vocab*D;
+        for(int64_t i=0;i<lh_n;i++) { float v=m->lm_head.qf[i]; if(v<0)v=-v; if(v>absmax_lh)absmax_lh=v; }
+        /* Check first 5 logits */
+        fprintf(stderr,"[LOGITS] lm_head_absmax=%.4f logit[760]=%.4f logit[7993]=%.4f logit[7338]=%.4f\n",
+            absmax_lh,logit[760],logit[7993],logit[7338]);
+    }
     /* Qwen3.5/3.6: final_norm has RMS~3.37 → logits ~10x too large.
      * Scale down so temperature sampling works properly. */
     if(c->attn_type==2){
@@ -2664,6 +2725,23 @@ static float *step(Model *m, const int *ids, int S, int pos_base){
         for(int i=0;i<c->vocab;i++) logit[i]/=scale;
     }
     m->t_head += now_s()-th0;
+    if(getenv("DEBUG_LOGITS")){
+        /* Print top-5 logits */
+        float tmp_v[5]={0}, tmp_i[5]={0}; int tc=0;
+        for(int i=0;i<c->vocab;i++){
+            if(tc<5 || logit[i]>tmp_v[4]){
+                int pos=-1;
+                for(int j=0;j<5;j++) if(tmp_v[j]==logit[i]){pos=j;break;}
+                if(pos<0)pos=4;
+                for(int j=4;j>pos;j--){tmp_v[j]=tmp_v[j-1];tmp_i[j]=tmp_i[j-1];}
+                tmp_v[pos]=logit[i]; tmp_i[pos]=(float)i;
+                tc=tc<5?tc+1:tc;
+            }
+        }
+        fprintf(stderr,"[LOGITS] top-5:");
+        for(int j=0;j<5;j++) fprintf(stderr," %d(%.2f)",(int)tmp_i[j],tmp_v[j]);
+        fprintf(stderr,"\n");
+    }
     free(x); free(last); return logit;
 }
 

@@ -117,16 +117,38 @@ Model runs end-to-end and generates text, but output quality is poor:
 
 ### Remaining Issues
 
-- [ ] **Coherent text generation** — Model produces diverse tokens but not coherent English. Possible causes:
+- [ ] **BUG FOUND: Linear attention alpha produces negative values** (2026-07-13)
+  
+  Debug trace with DEBUG_LINEAR=1 shows:
+  ```
+  L0: a_all[0]=-0.6052 a_all[1]=0.0011
+  L0: h=0 vh=0 a_val=-0.6052
+  L0: t=0 state_rms=0.0011
+  L0: pre_out_y_rms=0.0000
+  L0: out_rms=0.0000
+  ```
+  
+  The alpha decay rate `a_val` is NEGATIVE (-0.6052). State decay: `S *= a_val` 
+  means S gets multiplied by -0.6052, flipping signs. After outer product addition, 
+  state has tiny RMS (0.0011). Final y = Q @ S produces zeros.
+  
+  **Root cause**: The alpha computation `exp(a_proj + dt_bias) * b_proj` is wrong.
+  The reference uses `F.logsigmoid(gk) / gate_logit_normalizer` (always <= 0),
+  then `v * exp(gk)` as gating. The C code's formula is algorithmically different.
+  
+  **Fix needed**: Replace alpha computation in linear_attn_forward() to match reference.
+  The model has: A_log [16], dt_bias [16], in_proj_a [16,1024], in_proj_b [16,1024].
+
+- [ ] **Coherent text generation** — After fixing alpha, verify model produces coherent English.
   - RoPE with theta=10^7 not differentiating positions enough (first few pairs rotate, last 126 pairs have tiny angles)
   - MLP layers producing wrong outputs
   - BF16→F32 conversion quality (model weights loaded from safetensors as F32)
   - Missing normalization somewhere in the chain
-  - The linear attention recurrence itself may need tuning (A_log decay, dt_bias)
 
-- [ ] **PyTorch reference comparison** — No PyTorch/torch available for direct comparison. **ACTION REQUIRED**: Install torch, then:
-  1. Generate reference text from Qwen3.5 model
-  2. Compare per-token logits between C and PyTorch
+- [ ] **PyTorch reference comparison** — PyTorch/torch IS installed now (2.11.0+rocm7.13.0).
+  **ACTION**: Run the PyTorch reference and compare per-token logits:
+  1. `python3 c/torch_test.py --prompt "The cat sat" --save c/pytorch_ref.json`
+  2. Run C with same prompt and compare logits
   3. Identify first layer where outputs diverge
   4. Fix the offending layer
 
