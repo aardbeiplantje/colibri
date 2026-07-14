@@ -872,9 +872,9 @@ static void gqa_attention(Model *m, Layer *l, int layer,
     float *k_nrm = falloc((int64_t)bs_max * n_kv * hd);
     for(int bs = 0; bs < bs_max; bs++){
         rmsnorm(q_nrm + (int64_t)bs*n_heads*hd, q_all+(int64_t)bs*n_heads*hd,
-                l->qkn_ln_w_gqa, n_heads*hd, c->eps);
+                l->q_norm_w_gqa ? l->q_norm_w_gqa : l->qkn_ln_w_gqa, n_heads*hd, c->eps);
         rmsnorm(k_nrm + (int64_t)bs*n_kv*hd, k_all+(int64_t)bs*n_kv*hd,
-                l->qkn_ln_w_gqa, n_kv*hd, c->eps);
+                l->k_norm_w_gqa ? l->k_norm_w_gqa : l->qkn_ln_w_gqa, n_kv*hd, c->eps);
     }
 
     /* ── Full RoPE on Q and K ────────────────────────────────────────── */
@@ -1373,13 +1373,14 @@ static void load_cfg(Cfg *c, const char *snap){
     fprintf(stderr,"[CFG] v_head=%d n_shared=%d vocab=%d\n", c->v_head, c->n_shared, c->vocab);
     c->n_group=gi(r,"n_group"); c->topk_group=gi(r,"topk_group");
     jval *nt=json_get(r,"norm_topk_prob"); c->norm_topk=(nt&&nt->t==J_BOOL)?nt->boolean:0;
-    jval *ep=json_get(r,"rms_norm_eps"); c->eps=ep?(float)ep->num:1e-5f;
+    jval *ep=json_get(root,"rms_norm_eps"); c->eps=ep?(float)ep->num:1e-5f;
     jval *rs=json_get(r,"routed_scaling_factor"); c->routed_scale=rs?(float)rs->num:1.f;
-    jval *rp=json_get(r,"rope_parameters"); jval *th=rp?json_get(rp,"rope_theta"):NULL;
+    jval *rp=json_get(root,"rope_parameters"); jval *th=rp?json_get(rp,"rope_theta"):NULL;
     c->theta = th?(float)th->num:10000.f;
+    fprintf(stderr,"[CFG] rope_theta=%.0f\n",c->theta);
     /* ── Qwen3.6 parameters ──────────────────────────────────────────────────── */
     c->n_kv_heads = gi(root,"num_key_value_heads");
-    jval *hd = json_get(r,"head_dim");
+    jval *hd = json_get(root,"head_dim");
     c->head_dim = hd ? (int)hd->num : (c->hidden / c->n_heads);
     fprintf(stderr,"[CFG] head_dim=%d n_heads=%d n_kv=%d hidden=%d\n", c->head_dim, c->n_heads, c->n_kv_heads, c->hidden);
     /* GatedDeltaNet-specific */
@@ -1399,7 +1400,7 @@ static void load_cfg(Cfg *c, const char *snap){
     c->linear_key_head_dim = gi(root,"linear_key_head_dim");
     c->linear_value_head_dim = gi(root,"linear_value_head_dim");
     c->linear_conv_kernel_dim = gi(root,"linear_conv_kernel_dim");
-    jval *aog = json_get(r,"attn_output_gate");
+    jval *aog = json_get(root,"attn_output_gate");
     c->attn_output_gate = (aog && aog->t==J_BOOL) ? aog->boolean : 1;
     /* Detect model architecture type */
     jval *at = json_get(r,"architectures");
@@ -1416,7 +1417,7 @@ static void load_cfg(Cfg *c, const char *snap){
     }
     fprintf(stderr,"[CFG] attn_type=%d\n", c->attn_type);
     /* Parse layer_types array (e.g. ["linear_attention","full_attention",...]) */
-    jval *lt = json_get(r,"layer_types");
+    jval *lt = json_get(root,"layer_types");
     if(lt && lt->t==J_ARR){
         int nlt = lt->len < c->n_layers ? lt->len : c->n_layers;
         for(int i=0; i<nlt; i++){
@@ -1436,7 +1437,7 @@ static void load_cfg(Cfg *c, const char *snap){
     /* token di stop: GLM-5.2 ne ha TRE (endoftext, user, observation). Fermarsi solo sul
      * primo = generare spazzatura invisibile dopo la fine del turno (5-10x token sprecati). */
     c->n_stop=0;
-    jval *eo=json_get(r,"eos_token_id");
+    jval *eo=json_get(root,"eos_token_id");
     if(eo){ if(eo->t==J_NUM) c->stop_ids[c->n_stop++]=(int)eo->num;
             else if(eo->t==J_ARR) for(int i=0;i<eo->len && c->n_stop<8;i++)
                 c->stop_ids[c->n_stop++]=(int)eo->kids[i]->num; }
