@@ -59,6 +59,141 @@ left and right tokens at the last space.
 
 ## Phase 8.3 — Numerical Accuracy (IN PROGRESS)
 
+**Current blocker**: Linear attention alpha computation produces negative values, causing all layer outputs to be zero.
+
+### Next Steps (pick up from here after restart)
+
+1. **Fix alpha computation** in `linear_attn_forward()` (line ~1291):
+   - Current: `expf(a_val + dt) * b_val` → produces negative values
+   - Target: Reference pattern using `logsigmoid` → always produces valid (0,1] gate
+   - The model has `A_log` [16] F32, `dt_bias` [16], `in_proj_a` [16,1024], `in_proj_b` [16,1024]
+
+2. **Verify fix**:
+   ```bash
+   SNAP="../Qwen3.5-0.8B" DEBUG_LINEAR=1 PROMPT="The" NGEN=1 ./glm 64 8 8
+   # Check: L0 out_rms >> 0.0
+   ```
+
+3. **Compare with PyTorch reference**:
+   ```bash
+   python3 c/torch_test.py --prompt "The cat sat" --save c/pytorch_ref.json
+   # Then run C with same prompt and compare logits
+   ```
+
+4. **Fix remaining issues** (RoPE, MLP, etc.) if alpha fix resolves the zero output.
+
+### Debugging Session: Linear Attention Zero Output (2026-07-13)
+
+**CRITICAL BUG DISCOVERED**: The Qwen3.5 model produces ALL-ZERO hidden states after the first linear attention layer. Despite non-zero inputs at every stage, the final layer output is zero.
+
+#### Debug Tracing (with `DEBUG_LINEAR=1`)
+
+Step-by-step trace through Layer 0 (first linear attention layer, prompt="The", S=1):
+
+```bash
+$ SNAP="../Qwen3.5-0.8B" DEBUG_LINEAR=1 PROMPT="The" NGEN=1 ./glm 64 8 8
+[LIN] L0: in_rms=0.2455 qkv_rms=0.3567 conv_dim=6144  ← in_proj_qkv OK
+[LIN] L0: conv1d_w=0x... conv1d_n=24576                  ← conv1d weights loaded
+[LIN] L0: pre_l2_q_rms=0.0745 ln_w=0x...                 ← Q has content before L2
+[LIN] L0: q_l2=0.0011 inv_l2=678.5042                    ← Q L2 norm very small
+[LIN] L0: z_rms=0.2218 a_rms=0.2615 b_rms=-0.0365       ← Z, A, B projections non-zero
+[LIN] L0: t=0 k_rms=0.0712 v_rms=0.0296                 ← K, V have content
+[LIN] L0: a_all[0]=-0.6052 a_all[1]=0.0011              ← *** ALPHA IS NEGATIVE ***
+[LIN] L0: h=0 vh=0 a_val=-0.6052                         ← alpha used in decay
+[LIN] L0: t=0 state_rms=0.0011                           ← state barely nonzero
+[LIN] L0: pre_out_y_rms=0.0000                           ← *** OUTPUT ZERO ***
+[LIN] L0: post_out_rms=0.0000
+[LIN] L0: out_rms=0.0000
+```
+
+All subsequent layers also output zero because they receive zero input from layer 0.
+
+#### Root Cause Analysis
+
+The alpha computation in `linear_attn_forward()` is:
+```c
+float a_val = a_all[(int64_t)(t*B+b)*nq + h];  // from in_proj_a
+float dt = l->dt_bias[h];                       // learned bias [16]
+float b_val = b_all[(int64_t)(t*B+b)*nq + h];  // from in_proj_b
+a_all[...] = expf(a_val + dt) * b_val;          // PROBLEM HERE
+```
+
+This produces NEGATIVE values (e.g., -0.6052) because `b_val` can be negative and `exp(...)` is always positive.
+
+The alpha value is then used in state decay:
+```c
+state[b_off + h_off + i] *= a_val;  // multiplying by -0.6052 flips signs
+```
+
+After outer product addition, state has tiny RMS (0.0011). The output `y = Q @ S` produces effectively zero.
+
+#### Reference Implementation
+
+The fla-org reference (GatedDeltaNet) computes alpha differently:
+
+```python
+# From fla-org gated_delta_rule_ops/chunk.py
+gk = F.logsigmoid(gk) / self.gate_logit_normalizer  # always <= 0
+go = F.logsigmoid(go) / self.gate_logit_normalizer  # always <= 0
+# Gate V and beta:
+v = v * exp(gk)  # exp(gk) ∈ (0, 1] → multiplicative gate
+beta = beta * exp(go)  # same pattern
+```
+
+Key differences:
+1. Reference uses `logsigmoid` (log of sigmoid) → always negative → `exp(logsigmoid)` ∈ (0,1]
+2. Reference applies gating multiplicatively to V and beta, not computing alpha from projections
+3. Reference has `A_log` [16] tensor (learned log decay per head) used in the recurrence
+
+The C code's formula `exp(a_proj + dt_bias) * b_proj` is algorithmically different and produces invalid decay rates.
+
+#### Fix Required
+
+The alpha computation in `linear_attn_forward()` must match the reference:
+```c
+// Current (WRONG):
+a_all[bs*nq + h] = expf(a_val + dt) * b_val;
+
+// Should use reference pattern:
+// gk = a_proj (already computed, but needs sigmoid)
+// alpha_gate = expf(-expf(A_log[h]) * softplus(gk + dt_bias[h]))
+// This ensures alpha ∈ (0, 1)
+```
+
+The model has these tensors available:
+- `A_log` [16] F32 — learned log decay rate per head (already loaded in DeltaNet code)
+- `dt_bias` [16] BF16 — per-head bias (loaded as f32)
+- `in_proj_a` [16, 1024] BF16 — gate projection for V
+- `in_proj_b` [16, 1024] BF16 — gate projection for beta
+- `in_proj_z` [2048, 1024] BF16 — Z gate projection
+
+#### Verification Method
+
+After fixing, verify with:
+```bash
+SNAP="../Qwen3.5-0.8B" DEBUG_LINEAR=1 PROMPT="The" NGEN=1 ./glm 64 8 8
+# Expected: L0 out_rms >> 0.0 (non-zero output)
+```
+
+Compare against PyTorch reference:
+```bash
+python3 c/torch_test.py --prompt "The cat sat" --save c/pytorch_ref.json
+# Compare c/pytorch_ref.json with C output
+```
+
+#### Performance Baseline (Before Fix)
+
+| Metric | Value |
+|--------|-------|
+| Speed | 5.51 tok/s (single-thread CPU) |
+| Memory | 1.58 GB RSS |
+| MTP acceptance | 0% |
+| Speculation | 2.00 tokens/forward (1 forward per 2 tokens) |
+
+Output quality: `和白平台建设平台` (Chinese characters) — completely wrong.
+
+---
+
 ### Symptom
 
 Model runs end-to-end and generates text, but output quality is poor:
@@ -145,12 +280,24 @@ Model runs end-to-end and generates text, but output quality is poor:
   - BF16→F32 conversion quality (model weights loaded from safetensors as F32)
   - Missing normalization somewhere in the chain
 
-- [ ] **PyTorch reference comparison** — PyTorch/torch IS installed now (2.11.0+rocm7.13.0).
-  **ACTION**: Run the PyTorch reference and compare per-token logits:
+- [ ] **PyTorch reference comparison** — PyTorch IS installed (2.11.0+rocm7.13.0, ROCm gfx1151).
+  PyTorch generates coherent English:
+  ```
+  $ python3 c/torch_test.py --prompt "The cat sat" --ngenerate 3
+  on the floor, and the cat sat on the floor.
+The cat
+  ```
+  **ACTION**: Compare C vs PyTorch per-token logits:
   1. `python3 c/torch_test.py --prompt "The cat sat" --save c/pytorch_ref.json`
   2. Run C with same prompt and compare logits
   3. Identify first layer where outputs diverge
   4. Fix the offending layer
+
+- [ ] **PyTorch reference script** — `c/torch_test.py` provides:
+  - Greedy and temperature-based generation
+  - Top-5 vocabulary with logits and probabilities
+  - JSON output for comparison (`--save c/pytorch_ref.json`)
+  - Full vocabulary dump with `--verbose`
 
 - [ ] **Verify `linear_attn.norm.weight` values** — Check if weights look correct:
   - RMS should be ~1.0 (learned RMSNorm weights)
