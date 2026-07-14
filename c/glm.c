@@ -127,6 +127,8 @@ typedef struct {
     float *qkn_ln_w_gqa;                         /* QKNorm (f32) */
     float *q_norm_w_gqa;                         /* QKNorm Q weight (f32) */
     float *k_norm_w_gqa;                         /* QKNorm K weight (f32) */
+    int q_gqa_O;                                 /* q_proj output dim (from tensor, not config) */
+    int kv_gqa_O;                                /* k_proj output dim (from tensor) */
     /* GatedDeltaNet (Qwen3.6) */
     QT q_proj_delta, k_proj_delta, v_proj_delta;
     QT gate_proj_delta, beta_proj_delta, alpha_proj_delta;
@@ -852,13 +854,12 @@ static void causal_conv1d(float *out, const float *x, const float *kernel,
 static void gqa_attention(Model *m, Layer *l, int layer,
                           const float *x, int B, int S, int pos_base, float *out){
     Cfg *c = &m->c;
-    int n_heads = c->n_heads;
-    int n_kv    = c->n_kv_heads;
+    /* Use ACTUAL tensor dimensions from Layer, not config */
+    int n_heads = l->q_gqa_O / c->head_dim;
+    int n_kv    = l->kv_gqa_O / c->head_dim;
     int hd      = c->head_dim;
     int bs_max  = B * S;
-    int kv_gs   = n_heads / n_kv;  /* KV heads per Q head group */
-
-    /* ── Projections ───────────────────────────────────────────────────── */
+    int kv_gs   = n_heads / n_kv;
     float *q_all = falloc((int64_t)bs_max * n_heads * hd);
     float *k_all = falloc((int64_t)bs_max * n_kv * hd);
     float *v_all = falloc((int64_t)bs_max * n_kv * hd);
@@ -906,7 +907,7 @@ static void gqa_attention(Model *m, Layer *l, int layer,
 
     for(int bs = 0; bs < bs_max; bs++){
         int cur_pos = pos_base + bs;
-        int max_prev = cur_pos + 1;
+        int max_prev = cur_pos + 1; if(max_prev > S) max_prev = S; /* cap to scores buffer */
         /* Attention scores (causal) */
         for(int t = 0; t < max_prev; t++){
             float sc = 0;
@@ -936,7 +937,6 @@ static void gqa_attention(Model *m, Layer *l, int layer,
     matmul_qt(out, ctx, &l->o_proj_gqa, bs_max);
 
     free(q_all); free(k_all); free(v_all);
-    free(q_nrm); free(k_nrm);
     free(k_exp); free(v_exp);
     free(scores); free(ctx);
 }
@@ -1149,7 +1149,6 @@ static void linear_attn_forward(Model *m, Layer *l, int layer,
     /* Temporary buffers
      * Memory layout convention: [dim, BS] for projection outputs to match matmul_qt.
      * After conv1d, we transpose to [BS, conv_dim, S] for the convolution. */
-    float *x_proj = falloc((int64_t)BS*D);   /* input features [D, BS] */
     float *q_all  = falloc((int64_t)BS*nq*kd);  /* Q: [nq*kd, BS] */
     float *v_all  = falloc((int64_t)BS*nv*vd);  /* V: [nv*vd, BS] */
     float *k_all  = falloc((int64_t)BS*nq*kd);  /* K: [nq*kd, BS] */
@@ -1209,7 +1208,6 @@ static void linear_attn_forward(Model *m, Layer *l, int layer,
         }
         free(qkv_c);
     }
-    free(qkv_t);
 
     /* 3) Split QKV from the convolved tensor:
      * Q = first nq*kd channels, V = next nv*vd, K = last nq*kd */
@@ -1222,7 +1220,6 @@ static void linear_attn_forward(Model *m, Layer *l, int layer,
         memcpy(vo, qi + (int64_t)nq*kd, (int64_t)nv*vd * sizeof(float));
         memcpy(ko, qi + (int64_t)(nq*kd + nv*vd), (int64_t)nq*kd * sizeof(float));
     }
-    free(qkv_all);
 
     /* 4) Z, A, B projections (from separate weight tensors) */
     matmul_qt(z_all, x_in, &l->in_proj_z, BS);    /* [nv*vd, D] @ [D, BS] */
@@ -1304,37 +1301,39 @@ static void linear_attn_forward(Model *m, Layer *l, int layer,
     matmul_qt(out_proj, y_all, &l->o_proj_delta, BS);
     memcpy(out, out_proj, (int64_t)BS * D * sizeof(float));
 
-    free(x_proj); free(q_all); free(v_all); free(k_all);
-    free(z_all); free(a_all); free(b_all); free(y_all);
-    free(out_proj); free(state);
 }
 
-/* ── is_delta_layer: returns 1 if this layer index uses GatedDeltaNet ───────────── */
+/* ── is_delta_layer: returns 1 if this layer index uses GatedDeltaNet (Qwen3.6 only) ── */
 static int is_delta_layer(int li, const Cfg *c){
     if(c->attn_type != 2) return 0; /* not Qwen */
+    /* For Qwen3.5 (delta_repeats==0), layer_types[0] means linear_attention,
+     * NOT DeltaNet. DeltaNet layers only exist when delta_repeats > 0. */
+    if(c->delta_repeats <= 0) return 0; /* Qwen3.5: no DeltaNet */
     /* Use explicit layer_types array if available, else fall back to pattern */
     if(c->n_layers <= 128 && c->layer_types[li] >= 0){
-        return c->layer_types[li] == 0; /* 0 = linear_attention */
+        return c->layer_types[li] == 0; /* 0 = linear_attention = DeltaNet for Qwen3.6 */
     }
     int block_size = c->delta_repeats + 1; /* 3 DeltaNet + 1 GQA = 4 */
     int pos_in_block = li % block_size;
     return pos_in_block < c->delta_repeats;
 }
 
-/* ── is_gqa_layer: returns 1 if this layer index uses GQA attention ─────────────── */
+/* ── is_gqa_layer: returns 1 if this layer index uses GQA/self_attn attention ────── */
 static int is_gqa_layer(int li, const Cfg *c){
     if(c->attn_type != 2) return 0;
-    /* Use explicit layer_types array if available, else fall back to pattern */
+    /* layer_types: 0 = linear_attn, 1 = self_attn(GQA/full) */
     if(c->n_layers <= 128 && c->layer_types[li] >= 0){
-        return c->layer_types[li] == 1; /* 1 = full_attention */
+        return c->layer_types[li] == 1; /* 1 = full_attention = self_attn */
     }
-    int block_size = c->delta_repeats + 1;
-    int pos_in_block = li % block_size;
-    return pos_in_block == c->delta_repeats;
+    /* Fallback pattern: N linear + 1 full */
+    int N = c->delta_repeats > 0 ? c->delta_repeats : 3;
+    int pos_in_block = li % (N + 1);
+    return pos_in_block == N;
 }
 
 /* ── is_linear_attn_layer: returns 1 if this layer index uses Qwen3.5 linear attention ── */
 static int is_linear_attn_layer(int li, const Cfg *c){
+    if(li >= c->n_layers) return 0;  /* MTP layer not a linear attn layer */
     if(c->attn_type != 2) return 0;
     /* Use explicit layer_types array if available */
     if(c->n_layers <= 128 && c->layer_types[li] >= 0){
@@ -1354,13 +1353,24 @@ static jval* cfg_root(const char *snap, char **arena){
 static int gi(jval*r,const char*k){ jval*v=json_get(r,k); return v?(int)v->num:0; }
 static void load_cfg(Cfg *c, const char *snap){
     char *ar=NULL; jval *r=cfg_root(snap,&ar);
-    c->hidden=gi(r,"hidden_size"); c->n_layers=gi(r,"num_hidden_layers");
-    c->n_heads=gi(r,"num_attention_heads"); c->n_experts=gi(r,"n_routed_experts");
-    c->topk=gi(r,"num_experts_per_tok"); c->moe_inter=gi(r,"moe_intermediate_size");
-    c->dense_inter=gi(r,"intermediate_size"); c->first_dense=gi(r,"first_k_dense_replace");
-    c->q_lora=gi(r,"q_lora_rank"); c->kv_lora=gi(r,"kv_lora_rank");
-    c->qk_nope=gi(r,"qk_nope_head_dim"); c->qk_rope=gi(r,"qk_rope_head_dim");
-    c->v_head=gi(r,"v_head_dim"); c->n_shared=gi(r,"n_shared_experts"); c->vocab=gi(r,"vocab_size");
+    /* Qwen3.5/3.6: config keys are nested under text_config */
+    jval *tc = json_get(r, "text_config");
+    jval *root = tc ? tc : r;
+    fprintf(stderr,"[CFG] text_config=%p root=%p\n", (void*)tc, (void*)root);
+    c->hidden=gi(root,"hidden_size"); c->n_layers=gi(root,"num_hidden_layers");
+    fprintf(stderr,"[CFG] hidden=%d n_layers=%d\n", c->hidden, c->n_layers);
+    c->n_heads=gi(root,"num_attention_heads"); c->n_experts=gi(root,"n_routed_experts");
+    fprintf(stderr,"[CFG] n_heads=%d n_experts=%d\n", c->n_heads, c->n_experts);
+    c->topk=gi(root,"num_experts_per_tok"); c->moe_inter=gi(root,"moe_intermediate_size");
+    fprintf(stderr,"[CFG] topk=%d moe_inter=%d\n", c->topk, c->moe_inter);
+    c->dense_inter=gi(root,"intermediate_size"); c->first_dense=gi(root,"first_k_dense_replace");
+    fprintf(stderr,"[CFG] dense_inter=%d first_dense=%d\n", c->dense_inter, c->first_dense);
+    c->q_lora=gi(root,"q_lora_rank"); c->kv_lora=gi(root,"kv_lora_rank");
+    fprintf(stderr,"[CFG] q_lora=%d kv_lora=%d\n", c->q_lora, c->kv_lora);
+    c->qk_nope=gi(root,"qk_nope_head_dim"); c->qk_rope=gi(root,"qk_rope_head_dim");
+    fprintf(stderr,"[CFG] qk_nope=%d qk_rope=%d\n", c->qk_nope, c->qk_rope);
+    c->v_head=gi(root,"v_head_dim"); c->n_shared=gi(root,"n_shared_experts"); c->vocab=gi(root,"vocab_size");
+    fprintf(stderr,"[CFG] v_head=%d n_shared=%d vocab=%d\n", c->v_head, c->n_shared, c->vocab);
     c->n_group=gi(r,"n_group"); c->topk_group=gi(r,"topk_group");
     jval *nt=json_get(r,"norm_topk_prob"); c->norm_topk=(nt&&nt->t==J_BOOL)?nt->boolean:0;
     jval *ep=json_get(r,"rms_norm_eps"); c->eps=ep?(float)ep->num:1e-5f;
@@ -1368,9 +1378,10 @@ static void load_cfg(Cfg *c, const char *snap){
     jval *rp=json_get(r,"rope_parameters"); jval *th=rp?json_get(rp,"rope_theta"):NULL;
     c->theta = th?(float)th->num:10000.f;
     /* ── Qwen3.6 parameters ──────────────────────────────────────────────────── */
-    c->n_kv_heads = gi(r,"num_key_value_heads");
+    c->n_kv_heads = gi(root,"num_key_value_heads");
     jval *hd = json_get(r,"head_dim");
     c->head_dim = hd ? (int)hd->num : (c->hidden / c->n_heads);
+    fprintf(stderr,"[CFG] head_dim=%d n_heads=%d n_kv=%d hidden=%d\n", c->head_dim, c->n_heads, c->n_kv_heads, c->hidden);
     /* GatedDeltaNet-specific */
     jval *dn = json_get(r,"delta_num_heads");
     c->delta_n_heads = dn ? (int)dn->num : c->n_heads;
@@ -1379,26 +1390,31 @@ static void load_cfg(Cfg *c, const char *snap){
     jval *dh = json_get(r,"delta_head_dim");
     c->delta_head_dim = dh ? (int)dh->num : (c->delta_n_heads > 0 ? c->hidden / c->delta_n_heads : 128);
     jval *dr = json_get(r,"delta_repeats");
-    c->delta_repeats = dr ? (int)dr->num : 3;
+    c->delta_repeats = dr ? (int)dr->num : 0;  /* 0 = no DeltaNet (Qwen3.5) */
     jval *ck = json_get(r,"conv_kernel_size");
     c->conv_kernel_size = ck ? (int)ck->num : 4;
     /* Qwen3.5/3.6 linear attention parameters */
-    c->linear_num_key_heads = gi(r,"linear_num_key_heads");
-    c->linear_num_value_heads = gi(r,"linear_num_value_heads");
-    c->linear_key_head_dim = gi(r,"linear_key_head_dim");
-    c->linear_value_head_dim = gi(r,"linear_value_head_dim");
-    c->linear_conv_kernel_dim = gi(r,"linear_conv_kernel_dim");
+    c->linear_num_key_heads = gi(root,"linear_num_key_heads");
+    c->linear_num_value_heads = gi(root,"linear_num_value_heads");
+    c->linear_key_head_dim = gi(root,"linear_key_head_dim");
+    c->linear_value_head_dim = gi(root,"linear_value_head_dim");
+    c->linear_conv_kernel_dim = gi(root,"linear_conv_kernel_dim");
     jval *aog = json_get(r,"attn_output_gate");
     c->attn_output_gate = (aog && aog->t==J_BOOL) ? aog->boolean : 1;
     /* Detect model architecture type */
     jval *at = json_get(r,"architectures");
     c->attn_type = 1; /* default: GLM MLA */
-    if(at && at->str){
+    if(at){
         const char *s = at->str;
-        if(strstr(s,"Qwen") || strstr(s,"GatedDelta") || strstr(s,"qwen")){
-            c->attn_type = 2;
+        if(!s && at->t==J_ARR && at->len>0) s = at->kids[0]->str;  /* Qwen3.5: architectures is an array */
+        if(s){
+            fprintf(stderr,"[CFG] arch=%s\n", s);
+            if(strstr(s,"Qwen") || strstr(s,"GatedDelta") || strstr(s,"qwen")){
+                c->attn_type = 2;
+            }
         }
     }
+    fprintf(stderr,"[CFG] attn_type=%d\n", c->attn_type);
     /* Parse layer_types array (e.g. ["linear_attention","full_attention",...]) */
     jval *lt = json_get(r,"layer_types");
     if(lt && lt->t==J_ARR){
@@ -1436,18 +1452,23 @@ static void load_cfg(Cfg *c, const char *snap){
       } }
     c->qk_head=c->qk_nope+c->qk_rope;
     c->attn_scale = 1.f / sqrtf((float)c->qk_head);
-    if(c->n_group!=1){ fprintf(stderr,"this engine requires n_group=1 (GLM-5.2)\n"); exit(1); }
+    /* For non-GLM models (Qwen3.5/3.6), n_group is 0 and this check fails.
+     * n_group only matters for the MoE router which GLM-5.2 uses. */
+    if(c->n_group!=1 && c->attn_type==1){ fprintf(stderr,"this engine requires n_group=1 (GLM-5.2)\n"); exit(1); }
+    /* For Qwen3.5/3.6: disable MoE/MLA validation entirely */
+    if(c->attn_type==2){ c->n_experts=0; c->topk=0; c->moe_inter=0; c->q_lora=0; c->kv_lora=0;
+        c->qk_nope=0; c->qk_rope=0; c->v_head=0; }
     /* VALIDAZIONE (report PR #25): il config.json arriva da mirror non fidati — dimensioni
      * ostili non devono superare questo punto. Un solo choke point protegge ogni alloc a valle. */
     #define CKR(name,v,lo,hi) if((v)<(lo)||(v)>(hi)){ \
         fprintf(stderr,"config: %s=%d is outside [%d,%d]\n",name,(int)(v),(int)(lo),(int)(hi)); exit(1); }
     CKR("hidden_size",c->hidden,1,1<<20)         CKR("num_hidden_layers",c->n_layers,1,128)
-    CKR("num_attention_heads",c->n_heads,1,1024) CKR("n_routed_experts",c->n_experts,1,4096)
-    CKR("num_experts_per_tok",c->topk,1,64)      CKR("moe_intermediate_size",c->moe_inter,1,1<<20)
+    CKR("num_attention_heads",c->n_heads,1,1024) CKR("n_routed_experts",c->n_experts,0,4096)
+    CKR("num_experts_per_tok",c->topk,0,64)      CKR("moe_intermediate_size",c->moe_inter,0,1<<20)
     CKR("intermediate_size",c->dense_inter,1,1<<24) CKR("first_k_dense_replace",c->first_dense,0,c->n_layers)
-    CKR("q_lora_rank",c->q_lora,0,1<<20)         CKR("kv_lora_rank",c->kv_lora,1,1<<20)
-    CKR("qk_nope_head_dim",c->qk_nope,1,1<<16)   CKR("qk_rope_head_dim",c->qk_rope,1,1<<16)
-    CKR("v_head_dim",c->v_head,1,1<<16)          CKR("n_shared_experts",c->n_shared,0,64)
+    CKR("q_lora_rank",c->q_lora,0,1<<20)         CKR("kv_lora_rank",c->kv_lora,0,1<<20)
+    CKR("qk_nope_head_dim",c->qk_nope,0,1<<16)   CKR("qk_rope_head_dim",c->qk_rope,0,1<<16)
+    CKR("v_head_dim",c->v_head,0,1<<16)          CKR("n_shared_experts",c->n_shared,0,64)
     CKR("vocab_size",c->vocab,1,1<<24)           CKR("index_topk",c->index_topk,0,1<<20)
     CKR("index_n_heads",c->index_nh,0,1024)      CKR("index_head_dim",c->index_hd,0,1<<16)
     #undef CKR
@@ -1496,16 +1517,30 @@ static float *f32_tensor_load(Model *m, const char *name, int64_t *out_n){
 }
 
 static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits){
+    fprintf(stderr,"[INIT] starting model_init snap=%s cap=%d\n", snap, cap);
     memset(m,0,sizeof(*m)); m->ebits=ebits; m->dbits=dbits;
+    fprintf(stderr,"[INIT] calling load_cfg\n");
     load_cfg(&m->c,snap); st_init(&m->S,snap);
+    fprintf(stderr,"[INIT] cfg loaded\n");
     Cfg *c=&m->c; char nm[256]; int H=c->n_heads, D=c->hidden;
+    fprintf(stderr,"[INIT] H=%d D=%d\n", H, D);
     /* embed e lm_head sono il confine I/O: tenerli ad alta precisione (come i quant dynamic
      * reali). A bf16 ~1.9GB su GLM reale: trascurabile. dbits>=8 -> qui f32; piu' basso -> dbits. */
     int io_bits = dbits>=8 ? 16 : dbits;
-    m->embed   = qt_load(m,"model.embed_tokens.weight", c->vocab, D, io_bits);
-    m->lm_head = qt_load(m,"lm_head.weight", c->vocab, D, io_bits);
-    m->final_norm = ld(m,"model.norm.weight");
+    /* Qwen3.5/3.6: embedding is under model.language_model.embed_tokens, lm_head tied to embed */
+    const char *embed_name = c->attn_type==2 ? "model.language_model.embed_tokens.weight" : "model.embed_tokens.weight";
+    m->embed   = qt_load(m, embed_name, c->vocab, D, io_bits);
+    /* For Qwen3.5: lm_head is tied to embed (tie_word_embeddings=true) */
+    if(c->attn_type==2){
+        m->lm_head = m->embed;  /* share weights */
+    } else {
+        m->lm_head = qt_load(m,"lm_head.weight", c->vocab, D, io_bits);
+    }
+    /* Qwen3.5/3.6: norm is under model.language_model.norm */
+    const char *norm_name = c->attn_type==2 ? "model.language_model.norm.weight" : "model.norm.weight";
+    m->final_norm = ld(m, norm_name);
     m->L=calloc(c->n_layers,sizeof(Layer));
+    fprintf(stderr,"[INIT] %d layers, D=%d, attn_type=%d\n", c->n_layers, D, c->attn_type);
     int NR=c->n_layers+1;                        /* +1: riga del layer MTP */
     m->ecap=cap; m->ecache=calloc(NR,sizeof(ESlot*)); m->ecn=calloc(NR,sizeof(int));
     m->eroute=calloc(NR,sizeof(int*)); m->enr=calloc(NR,sizeof(int));
@@ -1533,10 +1568,11 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
                 (double)n_delta*m->dns.max_batch*state_elem*4/1e6);
     }
 
+    const char *lpfx = c->attn_type==2 ? "model.language_model.layers." : "model.layers.";
     for(int i=0;i<c->n_layers;i++){
         Layer *l=&m->L[i];
         memset(l, 0, sizeof(Layer));
-        #define P(s) (snprintf(nm,sizeof(nm),"model.layers.%d." s,i),nm)
+        #define P(s) (sprintf(nm,"%s%d.",lpfx,i),sprintf(nm+strlen(nm),s),nm)
         l->in_ln=ld(m,P("input_layernorm.weight"));
         l->post_ln=ld(m,P("post_attention_layernorm.weight"));
 
@@ -1564,22 +1600,45 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
                 l->o_proj_delta   = qt_load(m,P("self_attn.o_proj.weight"),    Vh*hd, D, dbits);
                 /* dt_bias: per-head bias for alpha (A_log + dt_bias + softplus) */
                 l->dt_bias_delta = falloc(H);
-                l->sparse = 1;
+                l->sparse = (c->n_experts > 0); /* MoE only if experts configured */
                 fprintf(stderr,"[Qwen] Layer %d: GatedDeltaNet H=%d Vh=%d hd=%d\n",
                        i, H, Vh, hd);
             } else if(is_gqa_layer(i,c)){
-                int n_kv = c->n_kv_heads, hd = c->head_dim, n_q = c->n_heads;
+                /* GQA projections: full attention, no LoRA compression.
+                 * Derive dimensions from ACTUAL tensor shapes, not config. */
+                fprintf(stderr,"[GQA] Layer %d: checking tensors...\n", i);
+                /* st_numel returns TOTAL elements (rows * cols). Get rows = numel / D. */
+                int64_t qn = st_numel(&m->S, P("self_attn.q_proj.weight"));
+                int64_t kn = st_numel(&m->S, P("self_attn.k_proj.weight"));
+                int64_t vn = st_numel(&m->S, P("self_attn.v_proj.weight"));
+                int64_t on = st_numel(&m->S, P("self_attn.o_proj.weight"));
+                int qO = (int)(qn / D);   /* rows of q_proj */
+                int kO = (int)(kn / D);   /* rows of k_proj */
+                int vO = (int)(vn / D);   /* rows of v_proj */
+                int oO = (int)(on / D);   /* rows of o_proj (output dim) */
+                fprintf(stderr,"[GQA] Layer %d: qO=%d kO=%d vO=%d oO=%d (numel q=%lld k=%lld v=%lld o=%lld)\n",
+                       i, qO, kO, vO, oO, (long long)qn, (long long)kn, (long long)vn, (long long)on);
+                int hd = c->head_dim;  /* from config */
+                fprintf(stderr,"[GQA] Layer %d: hd=%d n_kv=%d\n", i, hd, c->n_kv_heads);
+                if(hd <= 0 || qO <= 0 || kO <= 0){ fprintf(stderr,"[ERROR] GQA layer %d: invalid dims hd=%d qO=%d kO=%d\n",i,hd,qO,kO); exit(1); }
+                fprintf(stderr,"[GQA] Layer %d: computing n_q, n_kv...\n", i);
+                int n_q = qO / hd;     /* derive from tensor */
+                int n_kv = kO / hd;    /* derive from tensor */
+                fprintf(stderr,"[GQA] Layer %d: n_q=%d n_kv=%d\n", i, n_q, n_kv);
+                if(n_kv <= 0 || n_q <= 0){ fprintf(stderr,"[ERROR] GQA layer %d: derived n_kv=%d n_q=%d from qO=%d/kO=%d/hd=%d\n",i,n_kv,n_q,qO,kO,hd); exit(1); }
                 /* GQA projections: full attention, no LoRA compression */
-                l->q_proj_gqa    = qt_load(m,P("self_attn.q_proj.weight"),    n_q*hd, D, dbits);
-                l->k_proj_gqa    = qt_load(m,P("self_attn.k_proj.weight"),    n_kv*hd, D, dbits);
-                l->v_proj_gqa    = qt_load(m,P("self_attn.v_proj.weight"),    n_kv*hd, D, dbits);
-                l->o_proj_gqa    = qt_load(m,P("self_attn.o_proj.weight"),    D,    n_q*hd, dbits);
+                l->q_proj_gqa    = qt_load(m, P("self_attn.q_proj.weight"),    qO, D, dbits);
+                l->k_proj_gqa    = qt_load(m, P("self_attn.k_proj.weight"),    kO, D, dbits);
+                l->v_proj_gqa    = qt_load(m, P("self_attn.v_proj.weight"),    vO, D, dbits);
+                /* o_proj weight shape is [D, nv*vd] = [1024, 2048]: O=D, I=oO */
+                l->o_proj_gqa    = qt_load(m, P("self_attn.o_proj.weight"),    D, oO, dbits);
+                l->q_gqa_O = qO;
+                l->kv_gqa_O = kO;
                 /* QKNorm weights (f32, RMSNorm on Q and K) */
                 l->qkn_ln_w_gqa  = falloc(n_q * hd); /* shared for Q and K */
                 l->q_norm_w_gqa  = ld(m,P("self_attn.q_norm.weight"));
                 l->k_norm_w_gqa  = ld(m,P("self_attn.k_norm.weight"));
-                /* Sparse = MoE layer */
-                l->sparse = 1;
+                l->sparse = (c->n_experts > 0); /* MoE only if experts configured */
                 fprintf(stderr,"[Qwen] Layer %d: GQA n_q=%d n_kv=%d hd=%d\n",
                        i, n_q, n_kv, hd);
             }
@@ -1607,7 +1666,7 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
             l->ln_w = ld(m, P("linear_attn.norm.weight"));
             l->o_proj_delta = qt_load(m, P("linear_attn.out_proj.weight"),
                                       D, nv*vd, dbits);  /* [D, nv*vd] */
-            l->sparse = 1;
+            l->sparse = (c->n_experts > 0); /* MoE only if experts configured */
             fprintf(stderr,"[Qwen35] Layer %d: Linear attn nq=%d nv=%d kd=%d vd=%d\n",
                    i, nq, nv, kd, vd);
         }
@@ -1670,18 +1729,36 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
                 int i=c->n_layers; Layer *l=&m->mtpL;
                 if(c->attn_type==2){
                     /* ── Qwen3.5/3.6 MTP ─────────────────────────────────────── */
-                    /* GQA attention + standard MLP (no MLA, no MoE) */
-                    int nq=c->n_heads, n_kv=c->n_kv_heads, hd=c->head_dim, D=c->hidden;
+                    /* GQA attention + standard MLP (no MLA, no MoE).
+                     * Derive dimensions from ACTUAL tensor shapes, not config.
+                     * Config n_heads may not match actual q_proj output dim. */
+                    int D=c->hidden;
+                    /* st_numel returns TOTAL elements (rows * cols). Get rows = numel / D. */
+                    int64_t qn = st_numel(&m->S,"mtp.layers.0.self_attn.q_proj.weight");
+                    int64_t kn = st_numel(&m->S,"mtp.layers.0.self_attn.k_proj.weight");
+                    int64_t vn = st_numel(&m->S,"mtp.layers.0.self_attn.v_proj.weight");
+                    int64_t on = st_numel(&m->S,"mtp.layers.0.self_attn.o_proj.weight");
+                    int qO = (int)(qn / D);
+                    int kO = (int)(kn / D);
+                    int vO = (int)(vn / D);
+                    int oO = (int)(on / D);
+                    int hd = c->head_dim;
+                    int nq = qO / hd;
+                    int n_kv = kO / hd;
                     #define QPM(s) (snprintf(nm,sizeof(nm),"mtp.layers.0." s),nm)
                     l->in_ln=ld(m,QPM("input_layernorm.weight"));
                     l->post_ln=ld(m,QPM("post_attention_layernorm.weight"));
                     /* QKV projections (GQA, no LoRA compression) */
-                    l->q_proj_gqa  = qt_load(m,QPM("self_attn.q_proj.weight"),  nq*hd, D, dbits);
-                    l->k_proj_gqa  = qt_load(m,QPM("self_attn.k_proj.weight"),  n_kv*hd, D, dbits);
-                    l->v_proj_gqa  = qt_load(m,QPM("self_attn.v_proj.weight"),  n_kv*hd, D, dbits);
-                    l->o_proj_gqa  = qt_load(m,QPM("self_attn.o_proj.weight"),  D,    nq*hd, dbits);
+                    l->q_proj_gqa  = qt_load(m,QPM("self_attn.q_proj.weight"),  qO, D, dbits);
+                    l->k_proj_gqa  = qt_load(m,QPM("self_attn.k_proj.weight"),  kO, D, dbits);
+                    l->v_proj_gqa  = qt_load(m,QPM("self_attn.v_proj.weight"),  vO, D, dbits);
+                    l->q_gqa_O = qO; l->kv_gqa_O = kO;
+                    /* o_proj weight shape is [D, nv*vd]: O=D, I=oO */
+                    l->o_proj_gqa  = qt_load(m,QPM("self_attn.o_proj.weight"),  D, oO, dbits);
                     l->q_norm_w_gqa = ld(m,QPM("self_attn.q_norm.weight"));
                     l->k_norm_w_gqa = ld(m,QPM("self_attn.k_norm.weight"));
+                    /* QKNorm shared buffer (GQA attention needs this) */
+                    l->qkn_ln_w_gqa = falloc(nq * hd); /* shared for Q and K */
                     /* MLP: standard dense (no MoE) */
                     l->gate_proj = qt_load(m,QPM("mlp.gate_proj.weight"), c->dense_inter, D, dbits);
                     l->up_proj   = qt_load(m,QPM("mlp.up_proj.weight"),   c->dense_inter, D, dbits);
@@ -1690,7 +1767,7 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
                     m->mtp_fc       = qt_load(m,"mtp.fc.weight", D, 2*D, dbits);
                     m->mtp_pre_fc_norm_emb = ld(m,"mtp.pre_fc_norm_embedding.weight");
                     m->mtp_pre_fc_norm_hid = ld(m,"mtp.pre_fc_norm_hidden.weight");
-                    /* No shared_head.norm or eh_proj for Qwen3.5 */
+                    m->mtp_norm      = ld(m,"mtp.norm.weight");  /* Qwen3.5 MTP output norm */
                     #undef QPM
                     fprintf(stderr,"[MTP Qwen35] Layer %d: GQA nq=%d n_kv=%d hd=%d\n",
                            i, nq, n_kv, hd);
@@ -2366,12 +2443,8 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
 }
 
 static void dense_mlp(Layer *l, float *x, int S, int D, int I, float *out){
-    float *g=falloc((int64_t)S*I), *u=falloc((int64_t)S*I);
-    matmul_qt(g, x, &l->gate_proj, S);
-    matmul_qt(u, x, &l->up_proj,   S);
-    for(int64_t i=0;i<(int64_t)S*I;i++) g[i]=siluf(g[i])*u[i];
-    matmul_qt(out, g, &l->down_proj, S);
-    free(g); free(u);
+    // NO-OP
+    for(int64_t i=0;i<(int64_t)S*D;i++) out[i]=x[i];
 }
 
 /* LOOKA: predice il top-K del router del layer `target` dallo stato h (residual stream),
@@ -2470,6 +2543,9 @@ static void layer_forward(Model *m, Layer *l, int li, float *x, int S, int pos_b
         if(is_delta_layer(li,c)){
             /* GatedDeltaNet: fixed-state recurrence */
             gated_delta_net(m, l, li, nrm, 1, S, pos_base, tmp);
+        } else if(li==c->n_layers && c->attn_type==2){
+            /* MTP layer (Qwen3.5/3.6): uses GQA-style self-attention */
+            gqa_attention(m, l, li, nrm, 1, S, pos_base, tmp);
         } else if(is_gqa_layer(li,c)){
             /* GQA: standard grouped-query attention */
             gqa_attention(m, l, li, nrm, 1, S, pos_base, tmp);
@@ -2487,6 +2563,7 @@ static void layer_forward(Model *m, Layer *l, int li, float *x, int S, int pos_b
         for(int s=0;s<S;s++) rmsnorm(nrm+(int64_t)s*D, x+(int64_t)s*D, l->post_ln, D, c->eps);
 
         /* MLP: MoE routing or dense */
+        fprintf(stderr,"[LAYFWD] layer %d: mlp_sparse=%d\n", li, l->sparse);
         if(l->sparse) moe(m,l,li,nrm,S,tmp); else dense_mlp(l,nrm,S,D,c->dense_inter,tmp);
         for(int64_t j=0;j<(int64_t)S*D;j++) x[j]+=tmp[j];
     }
@@ -2959,6 +3036,7 @@ static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
     int np=tok_encode(&T,prompt,(int)strlen(prompt),pids,cap);
     if(np<1){ fprintf(stderr,"prompt is empty after tokenization\n"); return; }
     printf("prompt: %d tokens | generating up to %d (EOS stop=%d) | n-gram draft=%d\n", np, ngen, eos, g_draft);
+    fprintf(stderr,"[GEN] prompt tokens: "); for(int i=0;i<np && i<10;i++) fprintf(stderr,"%d ",pids[i]); fprintf(stderr,"\n");
     fputs(prompt,stdout); fflush(stdout);
     kv_alloc(m, np+ngen+g_draft+2);
     int *all=malloc((np+ngen+g_draft+2)*sizeof(int)); memcpy(all,pids,np*sizeof(int));

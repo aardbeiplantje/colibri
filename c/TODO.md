@@ -11,7 +11,81 @@
 | 5 | Qwen3.6 hybrid architecture (DeltaNet + GQA) | ✅ Done |
 | 6 | Config parsing (Qwen3.5/3.6 params, layer_types) | ✅ Done |
 | 7 | Qwen3.5 linear attention kernel + GGUF FP4 tool + P0 fixes | ✅ Done |
-| 8 | End-to-end integration, testing, benchmarking | 🔲 Next |
+| 8 | End-to-end integration, testing, benchmarking | 🟡 Partial — Qwen3.5 runs without crash |
+
+---
+
+### Phase 8.1 — Crash Fixes (2026-07-13)
+
+Fixed 5 critical crashes that prevented Qwen3.5 from running:
+
+1. **FPE in matmul_q_idot** — `st_numel()` returns total elements (rows×cols), not row count.
+   Fixed by computing `rows = st_numel / D` for tensor dimensions in GQA layer loading.
+
+2. **Segfault: `o_proj_gqa` dimension swap** — Weight tensor shape [D, nv*vd] but `qt_load` was called with `O=nv*vd, I=D` (swapped).
+   Fixed: `qt_load(m, name, O=D, I=oO, dbits)`.
+
+3. **Segfault: `mtp_norm` NULL** — Qwen3.5 MTP loading didn't load `mtp.norm.weight`.
+   Fixed: Added `m->mtp_norm = ld(m, "mtp.norm.weight")` in MTP loading.
+
+4. **Segfault: `qkn_ln_w_gqa` NULL** — MTP layer didn't set `qkn_ln_w_gqa`.
+   Fixed: Added `l->qkn_ln_w_gqa = falloc(nq * hd)` in MTP loading.
+
+5. **Segfault: MTP layer routed to linear attention** — `is_linear_attn_layer(24, c)` returned true for MTP layer (layer_types[24]=0 uninitialized).
+   Fixed: Added `li >= c->n_layers` guard in `is_linear_attn_layer`, and explicit `li==c->n_layers && c->attn_type==2` check in `layer_forward`.
+
+6. **Buffer overflow in GQA scores** — `max_prev = cur_pos + 1` could exceed `S`.
+   Fixed: `if(max_prev > S) max_prev = S`.
+
+7. **Config parsing: `n_kv_heads` and linear attention params** — Read from wrong JSON object (`r` instead of `root`).
+8. **MTP `q_gqa_O`/`kv_gqa_O` not set** — GQA function uses these for head dimension computation.
+   Fixed: Added `l->q_gqa_O = qO; l->kv_gqa_O = kO` in MTP loading.
+
+### Phase 8.2 — Tokenizer Format Fix (2026-07-13)
+
+Fixed Qwen3.5 tokenizer loading. The tokenizer has two different merge formats:
+- **GLM-5.2**: merges are objects `[{"source":...,"target":...}]` with `kids[0].str` / `kids[1].str`
+- **Qwen3.5**: merges are string pairs `"Ġ Ġ"` (left token, space, right token)
+
+The old code only handled GLM-5.2 format and crashed on Qwen3.5. Fixed by auto-detecting
+the format via `jval->t == J_STR` and parsing strings with `strrchr(pr->str, ' ')` to split
+left and right tokens at the last space.
+
+### Phase 8.3 — Numerical Accuracy Issues (TODO)
+
+Model runs end-to-end and generates text, but output quality is poor. Debugging needed:
+
+- [ ] **Forward pass logit analysis** — Add DEBUG_LOGITS=1 path to dump top-5 logits per step
+  and compare against PyTorch reference (`/tmp/gdtn/lit_gpt/gated_delta_net.py`)
+- [ ] **Attention scores** — GQA attention may produce NaN/Inf or all-zeros. Add sanity checks:
+  - After softmax: verify scores sum to 1.0 and no NaN/Inf
+  - After QKNorm: verify RMS values are in expected range (~1.0 for normalized weights)
+  - After attention output: check for overflow in the [32 heads × 128 dim] QKV buffers
+- [ ] **Linear attention recurrence** — The outer-product recurrence `S[h] += K[t,h] ⊗ V[t,h]` 
+  with exponential decay `A[t]` may underflow/overflow. Check:
+  - `A_log = 1.0` is used for decay (should produce values in (0,1] range)
+  - State buffer doesn't accumulate NaN over 12+ sequence steps
+  - Conv1d projection produces reasonable activations (no all-zeros from weight loading)
+- [ ] **MTP draft acceptance** — Currently 0% acceptance rate. The MTP draft path runs 
+  GQA attention on layer 24 weights. Possible causes:
+  - Draft tokens from MTP don't match autoregressive predictions (indicates model weights 
+    or forward pass issue)
+  - Draft path has different normalization/timing than base path
+- [ ] **Profiling gap** — GQA and linear attention don't measure timing (`m->t_attn` stays 0).
+  Add `ta0=now_s()` / `m->t_attn+=now_s()-ta0` in both `gqa_attention()` and 
+  `linear_attn_forward()`.
+- [ ] **Temperature/softmax** — Verify `g_temp=0.7` is applied correctly and doesn't 
+  produce degenerate sampling (all BOS tokens)
+
+### Phase 8.4 — Performance (TODO)
+
+- [ ] Add timing instrumentation to `gqa_attention()` and `linear_attn_forward()`
+- [ ] Benchmark on Strix Halo (gfx1151): prefill throughput, decode latency
+- [ ] Memory profiling: current RSS ~2GB, verify no leaks over long sequences
+   Fixed: Changed to use `root` (text_config) for Qwen3.5/3.6 params.
+
+8. **MTP layer `q_gqa_O`/`kv_gqa_O` not set** — GQA function computed `n_heads` from these fields.
+   Fixed: Added `l->q_gqa_O = qO; l->kv_gqa_O = kO` in MTP loading.
 
 ---
 

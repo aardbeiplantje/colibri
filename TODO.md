@@ -1,7 +1,7 @@
 # Implementation Plan: HIP + mmap + FP4 for Qwen3.6 on Strix Halo (gfx1151)
 
 > **Quick Status** (updated July 13, 2026): 5 of 8 phases done (62.5%).
-> Phases 1-6 complete. Remaining: Phase 7 (conversion tooling) → Phase 8 (integration).
+> Phases 1-7 complete. Phase 8: Qwen3.5 end-to-end runs, numerical accuracy debugging needed.
 
 ## Executive Summary
 
@@ -12,7 +12,7 @@ Migrate this GLM-5.2 inference engine to support:
 4. ✅ **GGUF FP4** quantization (E2M1 format, MXFP4/NVFP4) — **Phase 3** (indexer) / **Phase 4** (quant)
 5. ⬜ **RDNA4 FP4 hardware acceleration** (no hardware on gfx1151, using software) — **Phase 6**
 6. ⬜ **GGUF FP4 conversion tooling** (Python scripts) — **Phase 7**
-7. ⬜ **Integration, testing, benchmarking** (end-to-end on real model) — **Phase 8**
+7. 🟡 **Integration, testing, benchmarking** (Qwen3.5 runs end-to-end; numerical accuracy debugging) — **Phase 8**
 
 **Total estimated effort**: ~20-25 engineer-weeks, with phases of highly variable difficulty.
 

@@ -109,21 +109,38 @@ static void tok_load(Tok *T, const char *path){
 
     /* vocab: stringa -> id  (capacita' potenza di 2, ~2-3x) */
     int vc=1; while(vc < vocab->len*2) vc<<=1;
+    fflush(stderr);
     hm_init(&T->vocab, vc);
+    fflush(stderr);
     for(int i=0;i<vocab->len;i++){
         const char *k=vocab->keys[i]; int id=(int)vocab->kids[i]->num;
         hm_put(&T->vocab, k, (int)strlen(k), id);
         T->id2str[id]=(char*)k;
     }
-    /* merges: "left\0right" -> rank=i */
+    /* merges: "left\0right" -> rank=i
+     * Two formats:
+     *   GLM-5.2: merges is array of objects {"source":...,"target":...}
+     *   Qwen3.5: merges is array of strings "left right" */
     int mc=1; while(mc < merges->len*2) mc<<=1;
     hm_init(&T->merges, mc);
+    /* Detect format: check if first merge has kids (object) or str (string) */
+    int is_qwen = (merges->kids && merges->kids[0] && merges->kids[0]->t == J_STR);
     for(int i=0;i<merges->len;i++){
         jval *pr=merges->kids[i];
-        const char *l=pr->kids[0]->str, *r=pr->kids[1]->str;
-        int ll=(int)strlen(l), rl=(int)strlen(r);
-        char *key=malloc(ll+1+rl); memcpy(key,l,ll); key[ll]=0; memcpy(key+ll+1,r,rl);
-        hm_put(&T->merges, key, ll+1+rl, i);
+        char *key;
+        if(is_qwen){
+            /* Qwen3.5: pr->str = "left right" */
+            const char *sp = strrchr(pr->str, ' ');
+            int ll = (int)(sp - pr->str);
+            int rl = (int)strlen(sp+1);
+            key = malloc(ll+1+rl); memcpy(key,pr->str,ll); key[ll]=0; memcpy(key+ll+1,sp+1,rl);
+        } else {
+            /* GLM-5.2: pr->kids[0].str and pr->kids[1].str */
+            const char *l=pr->kids[0]->str, *r=pr->kids[1]->str;
+            int ll=(int)strlen(l), rl=(int)strlen(r);
+            key = malloc(ll+1+rl); memcpy(key,l,ll); key[ll]=0; memcpy(key+ll+1,r,rl);
+        }
+        hm_put(&T->merges, key, (int)strlen(key), i);
     }
     /* added tokens (speciali e non): atomici, output letterale */
     if(added){
