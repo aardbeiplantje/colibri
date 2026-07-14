@@ -1243,6 +1243,25 @@ static void linear_attn_forward(Model *m, Layer *l, int layer,
         memcpy(ko, qi + (int64_t)(nq*kd + nv*vd), (int64_t)nq*kd * sizeof(float));
     }
 
+    /* L2 normalize Q and K per head (like fla.LinearAttention).
+     * ln_w [128] is per-dimension weight applied after L2 norm. */
+    if(l->ln_w){
+        for(int bs = 0; bs < BS; bs++){
+            for(int h = 0; h < nq; h++){
+                float *qh = q_all + (int64_t)bs*nq*kd + (int64_t)h*kd;
+                float l2=0; for(int d=0;d<kd;d++) l2 += qh[d]*qh[d];
+                float inv_l2 = (l2 > 0) ? 1.0f/sqrtf(l2+1e-6) : 0; /* L2 norm = sqrt(sum x^2) */
+                for(int d=0;d<kd;d++) qh[d] = qh[d] * inv_l2 * l->ln_w[d];
+            }
+            for(int h = 0; h < nq; h++){
+                float *kh = k_all + (int64_t)bs*nq*kd + (int64_t)h*kd;
+                float l2=0; for(int d=0;d<kd;d++) l2 += kh[d]*kh[d];
+                float inv_l2 = (l2 > 0) ? 1.0f/sqrtf(l2+1e-6) : 0;
+                for(int d=0;d<kd;d++) kh[d] = kh[d] * inv_l2 * l->ln_w[d];
+            }
+        }
+    }
+
     /* 4) Z, A, B projections (from separate weight tensors) */
     matmul_qt(z_all, x_in, &l->in_proj_z, BS);    /* [nv*vd, D] @ [D, BS] */
     matmul_qt(a_all, x_in, &l->in_proj_a, BS);    /* [nq, D] @ [D, BS] */
@@ -1290,21 +1309,22 @@ static void linear_attn_forward(Model *m, Layer *l, int layer,
             }
         }
 
-        /* Compute output: y[t,b] = sum_h S[h] * Q[t,b,h] */
+        /* Compute output: y[t,b,h,j] = sum_i q[t,b,h,i] * S[t,b,h,i,j]
+         * Reference: einsum('bhd,bhdm->bhm', q, S)
+         * Each head h maps to output head h (1:1). Output shape [nv, vd]. */
         for(int b = 0; b < B; b++){
             int64_t b_off = (int64_t)b * state_size;
-            float *yo = y_all + (int64_t)(t*B+b)*nv*vd;
-            memset(yo, 0, (int64_t)nv*vd * sizeof(float));
-            for(int h = 0; h < nq; h++){
+            for(int h = 0; h < nv; h++){
+                float *yo_h = y_all + (int64_t)(t*B+b)*nv*vd + (int64_t)h*vd;
                 int64_t h_off = (int64_t)h * kd * vd;
                 const float *qh = q_all + (int64_t)(t*B+b)*nq*kd + (int64_t)h*kd;
                 const float *sh = state + b_off + h_off;
-                int vh = h * vd / nq;
-                if(vh >= nv) vh = nv - 1;
-                float *yo_h = yo + (int64_t)vh*vd;
-                for(int i = 0; i < kd; i++)
-                    for(int j = 0; j < vd; j++)
-                        yo_h[j] += sh[i*vd + j] * qh[i];
+                for(int j = 0; j < vd; j++){
+                    float acc = 0;
+                    for(int i = 0; i < kd; i++)
+                        acc += qh[i] * sh[i*vd + j];
+                    yo_h[j] = acc;
+                }
             }
         }
     }
