@@ -13,7 +13,7 @@
 | 7 | Qwen3.5 linear attention kernel + GGUF FP4 tool | ✅ Done |
 | 8.1 | Crash fixes (8 bugs) | ✅ Done |
 | 8.2 | Tokenizer format fix | ✅ Done |
-| 8.3 | Numerical accuracy — output quality | 🟡 In Progress |
+| 8.3 | Numerical accuracy — output quality | 🔴 Needs more work |
 
 ---
 
@@ -59,7 +59,27 @@ left and right tokens at the last space.
 
 ## Phase 8.3 — Numerical Accuracy (IN PROGRESS)
 
-**Current blocker**: Linear attention alpha computation produces negative values, causing all layer outputs to be zero.
+### Latest Progress (2026-07-14)
+
+**Critical Bug Fixes Applied:**
+1. **Qwen3.5 RMSNorm offset weights** — Added `rmsnorm_qw35()` that applies `(1.0 + weight)` instead of raw `weight`. PyTorch's `Qwen3_5RMSNorm` uses `weight = nn.Parameter(torch.zeros(dim))` and forward is `output = _norm(x) * (1.0 + weight)`. This was causing all layer norm outputs to be wrong.
+2. **F.silu after conv1d** — Added silu activation after conv1d in `linear_attn_forward()`, matching the reference.
+3. **softplus helper** — Added numerically stable softplus for alpha computation.
+
+**Current Status:**
+- Model now produces NON-ZERO activations ✓
+- Layer norm outputs are now correct (RMS ~1.22 vs expected ~1.0-1.2) ✓
+- Model generates tokens but produces INCOHERENT mixed-language output
+
+**Comparison:**
+- PyTorch: "The cat sat on the floor" (coherent English)
+- C: "The cat sat canoeadou敢于好用(BigDecimal señora conferencias" (gibberish)
+
+**Remaining Issues:**
+- Linear attention kernel output quality — Q/K normalization, state accumulation, or RoPE may be incorrect
+- MLP output quality  
+- Weight loading verification for some tensors
+- Alpha/gating computation may still not match reference pattern
 
 ### Next Steps (pick up from here after restart)
 
