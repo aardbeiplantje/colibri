@@ -753,6 +753,12 @@ static void rmsnorm(float *out, const float *x, const float *w, int D, float eps
     double ms=0; for(int i=0;i<D;i++) ms+=(double)x[i]*x[i];
     float r=1.f/sqrtf((float)(ms/D)+eps); for(int i=0;i<D;i++) out[i]=x[i]*r*w[i];
 }
+/* ── Qwen3.5 RMSNorm: out = x / sqrt(mean(x^2)+eps) * (1.0 + w) ──────────────────── */
+static void rmsnorm_qw35(float *out, const float *x, const float *w, int D, float eps){
+    double ms=0; for(int i=0;i<D;i++) ms+=(double)x[i]*x[i];
+    float r=1.f/sqrtf((float)(ms/D)+eps);
+    for(int i=0;i<D;i++){ float wf=1.0f+w[i]; out[i]=x[i]*r*wf; }
+}
 /* LayerNorm classica (media+varianza, weight+bias) — usata dal k_norm dell'indexer DSA */
 static void layernorm(float *v, const float *w, const float *b, int n, float eps){
     double mu=0; for(int i=0;i<n;i++) mu+=v[i]; mu/=n;
@@ -1233,8 +1239,9 @@ static void linear_attn_forward(Model *m, Layer *l, int layer,
         for(int b = 0; b < B; b++){
             for(int c_dim = 0; c_dim < conv_dim; c_dim++){
                 for(int t = 0; t < S; t++){
-                    qkv_all[(int64_t)c_dim*BS + (int64_t)b*S + t] =
-                        qkv_c[(int64_t)b*S*conv_dim + (int64_t)c_dim*S + t];
+                    float v = qkv_c[(int64_t)b*S*conv_dim + (int64_t)c_dim*S + t];
+                    /* Reference applies F.silu after conv1d */
+                    qkv_all[(int64_t)c_dim*BS + (int64_t)b*S + t] = siluf(v);
                 }
             }
         }
@@ -2626,8 +2633,8 @@ static void layer_forward(Model *m, Layer *l, int li, float *x, int S, int pos_b
         for(int64_t j=0;j<(int64_t)S*D;j++) x[j]+=tmp[j];
     } else {
         /* ── Qwen3.6 path: DeltaNet or GQA ──────────────────────────────────── */
-        /* Pre-attention normalization (input_layernorm) */
-        for(int s=0;s<S;s++) rmsnorm(nrm+(int64_t)s*D, x+(int64_t)s*D, l->in_ln, D, c->eps);
+        /* Pre-attention normalization (input_layernorm) — Qwen3.5 uses offset weights */
+        for(int s=0;s<S;s++) rmsnorm_qw35(nrm+(int64_t)s*D, x+(int64_t)s*D, l->in_ln, D, c->eps);
 
         if(is_delta_layer(li,c)){
             /* GatedDeltaNet: fixed-state recurrence */
@@ -2648,8 +2655,8 @@ static void layer_forward(Model *m, Layer *l, int li, float *x, int S, int pos_b
         /* Residual add */
         for(int64_t j=0;j<(int64_t)S*D;j++) x[j]+=tmp[j];
 
-        /* Post-attention normalization (post_attention_layernorm) */
-        for(int s=0;s<S;s++) rmsnorm(nrm+(int64_t)s*D, x+(int64_t)s*D, l->post_ln, D, c->eps);
+        /* Post-attention normalization (post_attention_layernorm) — Qwen3.5 offset weights */
+        for(int s=0;s<S;s++) rmsnorm_qw35(nrm+(int64_t)s*D, x+(int64_t)s*D, l->post_ln, D, c->eps);
 
         /* MLP: MoE routing or dense */
         fprintf(stderr,"[LAYFWD] layer %d: mlp_sparse=%d\n", li, l->sparse);
