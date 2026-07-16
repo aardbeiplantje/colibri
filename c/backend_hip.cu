@@ -69,7 +69,7 @@ __device__ static float fp4_e2m1_decode(int val) {
     int sign = val & 8;
     int exp = (val >> 1) & 3;
     int mant = val & 1;
-    float f = mant ? 0.5f : (1.0f + 0.5f * exp2f((float)(exp - 1)));
+    float f = (exp == 0) ? (mant ? 0.5f : 0.0f) : ((1.0f + 0.5f * mant) * exp2f((float)(exp - 1)));
     return sign ? -f : f;
 }
 
@@ -127,7 +127,12 @@ static int reserve(float **ptr, size_t *cap, size_t bytes) {
 extern "C" int coli_hip_init(const int *devices, int count) {
     int available = 0;
     if (!devices || count < 1 || count > COLI_HIP_MAX_DEVICES) return 0;
+    /* hipGetDeviceCount returns the number of AVAILABLE devices */
     HIP_CHECK(hipGetDeviceCount(&available), "device discovery");
+    if (available < 1) {
+        std::fprintf(stderr, "[HIP] no ROCm devices found. Is rocm-smi working?\n");
+        return 0;
+    }
     g_nctx = 0;
     for (int i = 0; i < count; i++) {
         int device = devices[i];

@@ -31,7 +31,33 @@
 #include <sys/resource.h>
 #include <sys/mman.h>                             /* mlock: inchioda le pagine in RAM / wire pages into RAM */
 #endif
-#include "st.h"
+#include "gguf.h"
+
+/* Helper macros to bridge st.h → gguf.h API */
+#define st_has(ctx, name)    (gguf_find(ctx, name) != NULL)
+#define st_find(ctx, name)   gguf_find(ctx, name)
+#define st_numel(ctx, name)  (_gguf_numel(ctx, name))
+#define st_nbytes(ctx, name) (_gguf_nbytes(ctx, name))
+
+static inline int64_t _gguf_numel(gguf_ctx *ctx, const char *name){
+    gguf_tensor *t = gguf_find(ctx, name);
+    if(!t) return -1;
+    int64_t n = 1;
+    for(int d=0; d<t->ndim; d++) n *= t->shape[d];
+    return n;
+}
+
+static inline int64_t _gguf_nbytes(gguf_ctx *ctx, const char *name){
+    gguf_tensor *t = gguf_find(ctx, name);
+    if(!t) return 0;
+    int64_t n = 1;
+    for(int d=0; d<t->ndim; d++) n *= t->shape[d];
+    if(t->dtype == GGML_TYPE_F32) return n * 4;
+    if(t->dtype == GGML_TYPE_F16) return n * 2;
+    if(t->dtype == GGML_TYPE_NVFP4) return (n + 1) / 2;
+    if(t->dtype == GGML_TYPE_NVFP8) return n;
+    return n * 2;  /* default to F16 */
+}
 #include "tok.h"
 #include "tier.h"
 #include "grammar.h"                              /* metodo F: draft grammaticali (#48) */
@@ -172,7 +198,7 @@ typedef struct {
 } DeltaNetState;
 
 typedef struct {
-    Cfg c; shards S;
+    Cfg c; gguf_ctx S;  /* GGUF-based tensor storage (replaces shards) */
     int ebits, dbits;                            /* bit expert / bit densa */
     QT embed, lm_head; float *final_norm;
     Layer *L;
@@ -382,13 +408,16 @@ static void matmul_fp4(float *y, const float *x, const uint8_t *q4, const float 
             for (int i=0;i<I;i+=2){
                 uint8_t byte=w[i>>1];
                 /* OCP FP4 E2M1 decode: sign=bit3, exp=bits2-1, mant=bit0
-                 * Formula: (1 + mant/2) * 2^(exp-1), bias=1. Subnormal: mant/2. */
+                 * exp=0 (subnormal): 0 or 0.5
+                 * exp=1: (1+0)*2^0=1, (1+0.5)*2^0=1.5
+                 * exp=2: (1+0)*2^1=2, (1+0.5)*2^1=3
+                 * exp=3: (1+0)*2^2=4, (1+0.5)*2^2=6 */
                 int v0=byte&0xF, v1=(byte>>4)&0xF;
                 float f0=0, f1=0;
                 if(v0){ int s0=v0&8, e0=(v0>>1)&3, m0=v0&1;
-                    f0=m0?0.5f:(1.0f+0.5f*exp2f((float)(e0-1))); if(s0)f0=-f0; }
+                    f0=(e0==0)?(m0?0.5f:0.0f):((1.0f+0.5f*m0)*exp2f((float)(e0-1))); if(s0)f0=-f0; }
                 if(v1){ int s1=v1&8, e1=(v1>>1)&3, m1=v1&1;
-                    f1=m1?0.5f:(1.0f+0.5f*exp2f((float)(e1-1))); if(s1)f1=-f1; }
+                    f1=(e1==0)?(m1?0.5f:0.0f):((1.0f+0.5f*m1)*exp2f((float)(e1-1))); if(s1)f1=-f1; }
                 a += xs[i]*f0;
                 if(i+1<I) a += xs[i+1]*f1;
             }
@@ -755,6 +784,8 @@ static void rmsnorm(float *out, const float *x, const float *w, int D, float eps
 }
 /* ── Qwen3.5 RMSNorm: out = x / sqrt(mean(x^2)+eps) * (1.0 + w) ──────────────────── */
 static void rmsnorm_qw35(float *out, const float *x, const float *w, int D, float eps){
+    /* Qwen3.5: PyTorch initializes weight as zeros and computes (1+weight)*norm(x).
+     * The GGUF stores the raw weight (not 1+weight). */
     double ms=0; for(int i=0;i<D;i++) ms+=(double)x[i]*x[i];
     float r=1.f/sqrtf((float)(ms/D)+eps);
     for(int i=0;i<D;i++){ float wf=1.0f+w[i]; out[i]=x[i]*r*wf; }
@@ -861,55 +892,79 @@ static void gqa_attention(Model *m, Layer *l, int layer,
                           const float *x, int B, int S, int pos_base, float *out){
     Cfg *c = &m->c;
     /* Use ACTUAL tensor dimensions from Layer, not config */
-    int n_heads = l->q_gqa_O / c->head_dim;
+    int full_qO = l->q_gqa_O;  /* includes both query + gate */
+    int half_qO = full_qO / 2; /* split: query = half, gate = half */
+    int n_heads = half_qO / c->head_dim;  /* actual number of attention heads */
     int n_kv    = l->kv_gqa_O / c->head_dim;
     int hd      = c->head_dim;
     int bs_max  = B * S;
     int kv_gs   = n_heads / n_kv;
-    float *q_all = falloc((int64_t)bs_max * n_heads * hd);
+    if(getenv("DEBUG_LAYER")){
+        fprintf(stderr,"[GQA%d] full_qO=%d half_qO=%d n_heads=%d n_kv=%d hd=%d kv_gs=%d\n",
+            layer, full_qO, half_qO, n_heads, n_kv, hd, kv_gs);
+    }
+    /* Q projection outputs [query; gate] combined. pytorch:
+     * query_states, gate = torch.chunk(q_proj(x), 2, dim=-1)
+     * We keep both halves in q_all, split here. */
+    float *q_all = falloc((int64_t)bs_max * full_qO);
     float *k_all = falloc((int64_t)bs_max * n_kv * hd);
     float *v_all = falloc((int64_t)bs_max * n_kv * hd);
+    
+    if(getenv("DEBUG_LAYER")){
+        int D = c->hidden;
+        float x_rms=0;
+        for(int j=0;j<D;j++) x_rms+=x[j]*x[j];
+        x_rms=sqrtf(x_rms/D);
+        fprintf(stderr,"[GQA%d] input_rms=%.6f input[0]=%.4f\n", layer, x_rms, x[0]);
+    }
+    
     matmul_qt(q_all, x, &l->q_proj_gqa, bs_max);
+    if(getenv("DEBUG_LAYER")){
+        fprintf(stderr,"[GQA%d] q_all[0]=%.6f q_all[1]=%.6f q_all[1023]=%.6f q_all[1024]=%.6f\n",
+            layer, q_all[0], q_all[1], q_all[1023], q_all[1024]);
+    }
     matmul_qt(k_all, x, &l->k_proj_gqa, bs_max);
     matmul_qt(v_all, x, &l->v_proj_gqa, bs_max);
 
-    /* ── QKNorm (RMSNorm on Q and K, per-head) ─────────────────────────
-     * Qwen3.5 q_norm weights are [head_dim] = [256], shared across all heads.
-     * GLM-5.2 qkn_ln_w_gqa is [n_heads*head_dim] per-head (falloc'd zeros).
-     * For Qwen3.5: apply per-head with same [head_dim] weights to each head.
-     * For GLM-5.2: batch rmsnorm with [n_heads*head_dim] weights.
-     * Detect: if q_norm_w_gqa exists (Qwen3.5 MTP), use per-head; else batch. */
-    float *q_nrm = falloc((int64_t)bs_max * n_heads * hd);
-    float *k_nrm = falloc((int64_t)bs_max * n_kv * hd);
+    /* ── QKNorm (RMSNorm on query only, per-head) ──────────────────────
+     * Gate is NOT normalized — it goes straight to the output stage.
+     * Qwen3.5: q_norm weights are [head_dim], zeros-init → (1+w)=1.0 (identity).
+     * GLM-5.2: qkn_ln_w_gqa is per-head weights (not zeros). */
     for(int bs = 0; bs < bs_max; bs++){
         if(l->q_norm_w_gqa){
-            /* Qwen3.5: q_norm is [head_dim], shared across heads — normalize per-head */
+            /* Qwen3.5: per-head RMSNorm with (1+weight), same as Qwen3_5RMSNorm */
             const float *qw = l->q_norm_w_gqa;
-            const float *kw = l->k_norm_w_gqa ? l->k_norm_w_gqa : qw;
             for(int h=0; h<n_heads; h++){
-                float q_rms=0; for(int d=0;d<hd;d++) q_rms+=q_all[(int64_t)bs*n_heads*hd+(int64_t)h*hd+d]*q_all[(int64_t)bs*n_heads*hd+(int64_t)h*hd+d];
+                float q_rms=0;
+                for(int d=0;d<hd;d++) q_rms+=q_all[(int64_t)bs*full_qO+(int64_t)h*hd+d]*q_all[(int64_t)bs*full_qO+(int64_t)h*hd+d];
                 q_rms=sqrtf(q_rms/hd+c->eps);
-                for(int d=0;d<hd;d++) q_nrm[(int64_t)bs*n_heads*hd+(int64_t)h*hd+d]=q_all[(int64_t)bs*n_heads*hd+(int64_t)h*hd+d]*qw[d]/q_rms;
-            }
-            for(int h=0; h<n_kv; h++){
-                float k_rms=0; for(int d=0;d<hd;d++) k_rms+=k_all[(int64_t)bs*n_kv*hd+(int64_t)h*hd+d]*k_all[(int64_t)bs*n_kv*hd+(int64_t)h*hd+d];
-                k_rms=sqrtf(k_rms/hd+c->eps);
-                for(int d=0;d<hd;d++) k_nrm[(int64_t)bs*n_kv*hd+(int64_t)h*hd+d]=k_all[(int64_t)bs*n_kv*hd+(int64_t)h*hd+d]*kw[d]/k_rms;
+                float inv = 1.0f / q_rms;
+                for(int d=0;d<hd;d++) q_all[(int64_t)bs*full_qO+(int64_t)h*hd+d] *= (1.0f+qw[d]) * inv;
             }
         } else {
-            /* GLM-5.2: qkn_ln_w_gqa is [n_heads*head_dim], batch rmsnorm */
-            rmsnorm(q_nrm + (int64_t)bs*n_heads*hd, q_all+(int64_t)bs*n_heads*hd,
+            /* GLM-5.2: batch rmsnorm with per-head weights */
+            rmsnorm(q_all + (int64_t)bs*full_qO, q_all+(int64_t)bs*full_qO,
                     l->qkn_ln_w_gqa, n_heads*hd, c->eps);
-            rmsnorm(k_nrm + (int64_t)bs*n_kv*hd, k_all+(int64_t)bs*n_kv*hd,
-                    l->qkn_ln_w_gqa, n_kv*hd, c->eps);
+        }
+        /* K normalization — per-head with (1+weight), same as Qwen3_5RMSNorm.
+         * Skip if no k_norm weight. */
+        if(l->k_norm_w_gqa){
+            const float *kw = l->k_norm_w_gqa;
+            for(int h=0; h<n_kv; h++){
+                float k_rms=0;
+                for(int d=0;d<hd;d++) k_rms+=k_all[(int64_t)bs*n_kv*hd+(int64_t)h*hd+d]*k_all[(int64_t)bs*n_kv*hd+(int64_t)h*hd+d];
+                k_rms=sqrtf(k_rms/hd+c->eps);
+                float inv = 1.0f / k_rms;
+                for(int d=0;d<hd;d++) k_all[(int64_t)bs*n_kv*hd+(int64_t)h*hd+d] *= (1.0f+kw[d]) * inv;
+            }
         }
     }
 
-    /* ── Full RoPE on Q and K ────────────────────────────────────────── */
+    /* ── Full RoPE on query only (not gate) ──────────────────────────── */
     for(int bs = 0; bs < bs_max; bs++){
-        rope_full(q_nrm + (int64_t)bs*n_heads*hd, pos_base + bs,
+        rope_full(q_all + (int64_t)bs*full_qO, pos_base + bs,
                   n_heads*hd, c->theta);
-        rope_full(k_nrm + (int64_t)bs*n_kv*hd, pos_base + bs,
+        rope_full(k_all + (int64_t)bs*n_kv*hd, pos_base + bs,
                   n_kv*hd, c->theta);
     }
 
@@ -921,42 +976,55 @@ static void gqa_attention(Model *m, Layer *l, int layer,
             int kvh = h / kv_gs;
             float *kh = k_exp + (int64_t)bs*n_heads*hd + (int64_t)h*hd;
             float *vh = v_exp + (int64_t)bs*n_heads*hd + (int64_t)h*hd;
-            const float *ksrc = k_nrm + (int64_t)bs*n_kv*hd + (int64_t)kvh*hd;
-            const float *vsrc = v_all     + (int64_t)bs*n_kv*hd + (int64_t)kvh*hd;
+            const float *ksrc = k_all + (int64_t)bs*n_kv*hd + (int64_t)kvh*hd;
+            const float *vsrc = v_all + (int64_t)bs*n_kv*hd + (int64_t)kvh*hd;
             memcpy(kh, ksrc, hd * sizeof(float));
             memcpy(vh, vsrc, hd * sizeof(float));
         }
     }
 
     /* ── Causal attention: scores + weighted V sum ───────────────────── */
-    float *scores = falloc((int64_t)bs_max * S);
-    float scale = 1.f / sqrtf((float)hd);
+    /* ctx size: n_heads*hd = half_qO (query-only, excludes gate) */
     float *ctx  = falloc((int64_t)bs_max * n_heads * hd);
+    float scale = 1.f / sqrtf((float)hd);
 
     for(int bs = 0; bs < bs_max; bs++){
         int cur_pos = pos_base + bs;
-        int max_prev = cur_pos + 1; if(max_prev > S) max_prev = S; /* cap to scores buffer */
-        /* Attention scores (causal) */
-        for(int t = 0; t < max_prev; t++){
-            float sc = 0;
-            for(int h = 0; h < n_heads; h++){
-                const float *q_h = q_nrm + (int64_t)bs*n_heads*hd + (int64_t)h*hd;
+        int max_prev = cur_pos + 1; if(max_prev > S) max_prev = S;
+        /* Per-head attention scores — each head has its own distribution */
+        float *scores = falloc((int64_t)S);
+        for(int h = 0; h < n_heads; h++){
+            for(int t = 0; t < max_prev; t++){
+                float sc = 0;
+                const float *q_h = q_all + (int64_t)bs*full_qO + (int64_t)h*hd;
                 const float *k_t = k_exp + (int64_t)t*n_heads*hd + (int64_t)h*hd;
                 for(int d = 0; d < hd; d++) sc += q_h[d] * k_t[d];
+                scores[t] = sc * scale;
             }
-            scores[(int64_t)bs*S + t] = sc * scale;
-        }
-        /* Mask future positions */
-        for(int t = max_prev; t < S; t++) scores[(int64_t)bs*S + t] = -1e30f;
-        softmax(scores + (int64_t)bs*S, S);
-        /* Weighted V sum */
-        for(int h = 0; h < n_heads; h++){
+            for(int t = max_prev; t < S; t++) scores[t] = -1e30f;
+            softmax(scores, S);
+            /* Weighted V sum for this head */
             float *a_h = ctx + (int64_t)bs*n_heads*hd + (int64_t)h*hd;
             memset(a_h, 0, hd * sizeof(float));
             for(int t = 0; t < max_prev; t++){
                 const float *v_h = v_exp + (int64_t)t*n_heads*hd + (int64_t)h*hd;
-                float w = scores[(int64_t)bs*S + t];
-                for(int d = 0; d < hd; d++) a_h[d] += w * v_h[d];
+                for(int d = 0; d < hd; d++) a_h[d] += scores[t] * v_h[d];
+            }
+        }
+        free(scores);
+    }
+
+    /* ── Apply Q-projection gate: attn_out *= sigmoid(gate) ────────────
+     * PyTorch: attn_output = attn_output * torch.sigmoid(gate)
+     * Gate lives in q_all[half_qO:full_qO, :]. */
+    for(int bs = 0; bs < bs_max; bs++){
+        const float *gate = q_all + (int64_t)bs*full_qO + (int64_t)n_heads*hd;
+        float *attn_out = ctx + (int64_t)bs*n_heads*hd;
+        for(int h = 0; h < n_heads; h++){
+            for(int d = 0; d < hd; d++){
+                float gv = gate[(int64_t)h*hd + d];
+                float sg = 1.0f / (1.0f + expf(-gv));  /* sigmoid */
+                attn_out[(int64_t)h*hd + d] *= sg;
             }
         }
     }
@@ -964,9 +1032,45 @@ static void gqa_attention(Model *m, Layer *l, int layer,
     /* ── Output projection ───────────────────────────────────────────── */
     matmul_qt(out, ctx, &l->o_proj_gqa, bs_max);
 
+    if(getenv("DEBUG_LAYER")){
+        int D = c->hidden;
+        /* Debug: attention output stats (before output proj) */
+        float rms_ctx=0, absmx_ctx=0;
+        for(int j=0;j<bs_max*n_heads*hd;j++){
+            float v=ctx[j]; rms_ctx+=v*v;
+            float av=v<0?-v:v; if(av>absmx_ctx)absmx_ctx=av;
+        }
+        rms_ctx=sqrtf(rms_ctx/(bs_max*n_heads*hd));
+        fprintf(stderr,"[GQA%d] attn_ctx_rms=%.6f ctx_absmax=%.6f\n",
+            layer, rms_ctx, sqrtf(absmx_ctx));
+        /* Debug: output projection stats */
+        float rms_out=0, absmx_out=0;
+        for(int j=0;j<D;j++){
+            float v=out[j]; rms_out+=v*v;
+            float av=v<0?-v:v; if(av>absmx_out)absmx_out=av;
+        }
+        rms_out=sqrtf(rms_out/D);
+        fprintf(stderr,"[GQA%d] o_proj_out_rms=%.6f o_proj_absmax=%.6f o_proj[0]=%.4f\n",
+            layer, rms_out, sqrtf(absmx_out), out[0]);
+        /* Debug: Q projection stats */
+        float rms_q=0;
+        for(int j=0;j<bs_max*full_qO;j++) rms_q+=q_all[j]*q_all[j];
+        rms_q=sqrtf(rms_q/(bs_max*full_qO));
+        /* Debug: K and V projection stats */
+        float rms_k=0, rms_v=0;
+        int64_t ksz=(int64_t)bs_max*n_kv*hd;
+        for(int j=0;j<ksz;j++) rms_k+=k_all[j]*k_all[j];
+        rms_k=sqrtf(rms_k/ksz);
+        int64_t vsz=(int64_t)bs_max*n_kv*hd;
+        for(int j=0;j<vsz;j++) rms_v+=v_all[j]*v_all[j];
+        rms_v=sqrtf(rms_v/vsz);
+        fprintf(stderr,"[GQA%d] q_proj_rms=%.6f k_proj_rms=%.6f v_proj_rms=%.6f\n",
+            layer, rms_q, rms_k, rms_v);
+    }
+
     free(q_all); free(k_all); free(v_all);
     free(k_exp); free(v_exp);
-    free(scores); free(ctx);
+    free(ctx);
 }
 
 /* ════ GatedDeltaNet Kernel (30 layers in Qwen3.6) ════════════════════════════════
@@ -1018,10 +1122,13 @@ static void gated_delta_net(Model *m, Layer *l, int layer,
     float *alpha_all = falloc((int64_t)BS*H);   /* [BS, H] */
     float *y_all = falloc((int64_t)BS*Vh*hd);   /* [BS, Vh, hd] output */
 
-    /* 1) Causal Conv1d on input */
-    causal_conv1d(x_conv, x_in, NULL, B, S, D, K);
-    /* kernel is in weights, handled by projection — for now just copy */
-    memcpy(x_conv, x_in, (int64_t)BS*D * sizeof(float));
+    /* 1) Causal Conv1d on input — apply conv1d weight */
+    if(l->conv1d_w && l->conv1d_n > 0){
+        causal_conv1d(x_conv, x_in, l->conv1d_w, B, S, D, K);
+    } else {
+        /* fallback: identity (no conv1d weight loaded) */
+        memcpy(x_conv, x_in, (int64_t)BS*D * sizeof(float));
+    }
 
     /* 2) Linear projections */
     matmul_qt(q_all, x_conv, &l->q_proj_delta, BS);
@@ -1175,26 +1282,42 @@ static void linear_attn_forward(Model *m, Layer *l, int layer,
     int BS = B * S;
 
     /* Temporary buffers
-     * Memory layout convention: [dim, BS] for projection outputs to match matmul_qt.
-     * After conv1d, we transpose to [BS, conv_dim, S] for the convolution. */
-    float *q_all  = falloc((int64_t)BS*nq*kd);  /* Q: [nq*kd, BS] */
-    float *v_all  = falloc((int64_t)BS*nv*vd);  /* V: [nv*vd, BS] */
-    float *k_all  = falloc((int64_t)BS*nq*kd);  /* K: [nq*kd, BS] */
-    float *z_all  = falloc((int64_t)BS*nv*vd);  /* Z gate: [nv*vd, BS] */
-    float *a_all  = falloc((int64_t)BS*nq);     /* A decay: [nq, BS] */
-    float *b_all  = falloc((int64_t)BS*nq);     /* B gate: [nq, BS] */
-    float *y_all  = falloc((int64_t)BS*nv*vd);  /* output: [nv*vd, BS] */
-    float *out_proj = falloc((int64_t)BS*D);    /* out proj result: [D, BS] */
+     * Memory layout convention: [BS, dim] for projection outputs from matmul_qt.
+     * matmul produces y[s*O+o] → row-major [BS, O] layout. */
+    float *q_all  = falloc((int64_t)BS*nq*kd);  /* Q: [BS, nq*kd] */
+    float *v_all  = falloc((int64_t)BS*nv*vd);  /* V: [BS, nv*vd] */
+    float *k_all  = falloc((int64_t)BS*nq*kd);  /* K: [BS, nq*kd] */
+    float *z_all  = falloc((int64_t)BS*nv*vd);  /* Z gate: [BS, nv*vd] */
+    float *a_all  = falloc((int64_t)BS*nq);     /* A decay: [BS, nq] */
+    float *b_all  = falloc((int64_t)BS*nq);     /* B gate: [BS, nq] */
+    float *y_all  = falloc((int64_t)BS*nv*vd);  /* output: [BS, nv*vd] */
+    float *out_proj = falloc((int64_t)BS*D);    /* out proj result: [BS, D] */
 
-    /* 1) Combined QKV projection: [conv_dim, D] @ [D, BS] -> [conv_dim, BS] */
+    /* 1) Combined QKV projection: [conv_dim, D] @ [D, BS] -> [BS, conv_dim] */
     float *qkv_all = falloc((int64_t)BS*conv_dim);
-    matmul_qt(qkv_all, x_in, &l->in_proj_qkv, BS);  /* input is x_in, not x_proj */
+    matmul_qt(qkv_all, x_in, &l->in_proj_qkv, BS);  /* matmul produces [BS, conv_dim] layout */
+    if(getenv("DEBUG_LINEAR") && layer==0){
+        /* Debug: dump first 10 in_proj_qkv weight values for comparison with PyTorch */
+        fprintf(stderr,"[LIN] L%d: in_proj_qkv weight[0]=%.8f weight[1]=%.8f weight[1023]=%.8f weight[1024]=%.8f\n",
+            layer, l->in_proj_qkv.qf[0], l->in_proj_qkv.qf[1],
+            l->in_proj_qkv.qf[1023], l->in_proj_qkv.qf[1024]);
+        fprintf(stderr,"[LIN] L%d: in_proj_qkv qf[100]=%.8f qf[101]=%.8f qf[102]=%.8f qf[103]=%.8f qf[104]=%.8f\n",
+            layer, l->in_proj_qkv.qf[100], l->in_proj_qkv.qf[101],
+            l->in_proj_qkv.qf[102], l->in_proj_qkv.qf[103], l->in_proj_qkv.qf[104]);
+        fprintf(stderr,"[LIN] L%d: x_in[0]=%.8f x_in[1]=%.8f x_in[100]=%.8f x_in[101]=%.8f x_in[102]=%.8f\n",
+            layer, x_in[0], x_in[1], x_in[100], x_in[101], x_in[102]);
+    }
     if(getenv("DEBUG_LINEAR")){
         float rms_in=0; for(int i=0;i<D;i++) rms_in+=x_in[i]*x_in[i];
         rms_in=sqrtf(rms_in/D);
-        float rms_qkv=0; for(int i=0;i<conv_dim;i++) rms_qkv+=qkv_all[i]*qkv_all[i];
-        rms_qkv=sqrtf(rms_qkv/conv_dim);
-        fprintf(stderr,"[LIN] L%d: in_rms=%.4f qkv_rms=%.4f conv_dim=%d\n",layer,rms_in,rms_qkv,conv_dim);
+        float rms_qkv=0; for(int bs=0;bs<BS;bs++) for(int i=0;i<conv_dim;i++) rms_qkv+=qkv_all[(int64_t)bs*conv_dim+i]*qkv_all[(int64_t)bs*conv_dim+i];
+        rms_qkv=sqrtf(rms_qkv/(BS*conv_dim));
+        /* NaN check */
+        int qkv_nan=0; for(int bs=0;bs<BS && !qkv_nan;bs++) for(int i=0;i<conv_dim && !qkv_nan;i++){
+            float v=qkv_all[(int64_t)bs*conv_dim+i];
+            if(v!=v){ qkv_nan=1; fprintf(stderr,"[LIN] L%d: NaN at qkv_all[%d,%d]\n",layer,bs,i); }
+        }
+        fprintf(stderr,"[LIN] L%d: in_rms=%.4f x_in[0]=%.4f qkv_all[0]=%.6f qkv_all[1]=%.6f qkv_rms=%.4f qkv_nan=%d\n",layer,rms_in,x_in[0],qkv_all[0],qkv_all[1],rms_qkv,qkv_nan);
     }
 
     /* 2) Causal conv1d on the projected QKV tensor.
@@ -1202,192 +1325,268 @@ static void linear_attn_forward(Model *m, Layer *l, int layer,
      * Conv is a grouped convolution: each channel convolved independently with kernel.
      * out[b, c, t] = sum_{k=0}^{K-1} input[b, c, t-k] * weight[c, k]  (causal)
      *
-     * We transpose qkv from [conv_dim, BS] -> [BS, conv_dim, S] for convolution,
-     * then apply conv1d, then transpose back to [conv_dim, BS] for splitting. */
-    /* Transpose: qkv[c*BS + b*S + t] -> qkv_t[b*S*conv_dim + c*S + t] */
+     * qkv_all from matmul is [BS, conv_dim]. Transpose to [BS, conv_dim, S] for conv1d.
+     * After conv1d, transpose back to [BS, conv_dim]. */
+    /* Transpose: [BS, conv_dim] -> [BS, conv_dim, S] */
     float *qkv_t = falloc((int64_t)BS*conv_dim*S);
     for(int b = 0; b < B; b++){
-        for(int c_dim = 0; c_dim < conv_dim; c_dim++){
-            for(int t = 0; t < S; t++){
-                qkv_t[(int64_t)b*S*conv_dim + (int64_t)c_dim*S + t] =
-                    qkv_all[(int64_t)c_dim*BS + (int64_t)b*S + t];
+        for(int t = 0; t < S; t++){
+            int bs = b*S + t;
+            for(int c_dim = 0; c_dim < conv_dim; c_dim++){
+                qkv_t[(int64_t)bs*conv_dim*S + (int64_t)c_dim*S + t] =
+                    qkv_all[(int64_t)bs * conv_dim + c_dim];
             }
         }
     }
 
-    /* Apply causal conv1d: grouped convolution with kernel=ck */
+    /* Apply causal conv1d: grouped convolution with kernel=ck.
+     * PyTorch: conv1d(padding=ck-1, kernel_size=ck) then truncate to S.
+     * out[t] = sum_{j=0..ck-1} x[t-j] * wc[ck-1-j] */
     if(getenv("DEBUG_LINEAR")){
-        fprintf(stderr,"[LIN] L%d: conv1d_w=%p conv1d_n=%ld\n",layer,(void*)l->conv1d_w,l->conv1d_n);
+        fprintf(stderr,"[LIN] L%d: conv1d_w=%p conv1d_n=%ld w[0]=%.6f w[1]=%.6f w[2]=%.6f w[3]=%.6f w[4]=%.6f w[100]=%.6f\n",
+            layer,(void*)l->conv1d_w,l->conv1d_n,
+            l->conv1d_w[0], l->conv1d_w[1], l->conv1d_w[2], l->conv1d_w[3],
+            l->conv1d_w[4], l->conv1d_w[100]);
     }
     if(l->conv1d_w && l->conv1d_n > 0){
         float *qkv_c = falloc((int64_t)BS*conv_dim*S); /* conv output */
         memset(qkv_c, 0, (int64_t)BS*conv_dim*S * sizeof(float));
         for(int b = 0; b < B; b++){
-            for(int c_dim = 0; c_dim < conv_dim; c_dim++){
-                const float *wc = l->conv1d_w + (int64_t)c_dim * ck;
-                float *out_c = qkv_c + (int64_t)b*S*conv_dim + (int64_t)c_dim*S;
-                for(int t = 0; t < S; t++){
+            for(int t = 0; t < S; t++){
+                int bs = b*S + t;
+                const float *wc_base = l->conv1d_w;
+                float *out_c = qkv_c + (int64_t)bs*conv_dim*S;
+                for(int c_dim = 0; c_dim < conv_dim; c_dim++){
+                    const float *wc = wc_base + (int64_t)c_dim * ck;
                     float acc = 0;
-                    for(int k = 0; k < ck && (t - k) >= 0; k++){
-                        acc += qkv_t[(int64_t)b*S*conv_dim + (int64_t)c_dim*S + (t - k)] * wc[k];
+                    for(int k = 0; k < ck; k++){
+                        int ti = t - (ck - 1 - k);  /* k=0 accesses t-(ck-1) [padded], k=ck-1 accesses t */
+                        if(ti < 0 || ti >= S) continue;
+                        acc += qkv_t[(int64_t)bs*conv_dim*S + (int64_t)c_dim*S + ti] * wc[k];
                     }
-                    out_c[t] = acc;
+                    out_c[c_dim*S + t] = acc;
                 }
             }
         }
-        /* Transpose back: [BS, conv_dim, S] -> [conv_dim, BS] */
+        if(getenv("DEBUG_LINEAR")){
+            float rms_c=0; for(int i=0;i<BS*conv_dim*S;i++) rms_c+=qkv_c[i]*qkv_c[i];
+            fprintf(stderr,"[LIN] L%d: conv1d_out_rms=%.6f conv1d_out[0]=%.6f conv1d_out[1]=%.6f\n",
+                layer, sqrtf(rms_c/(BS*conv_dim*S)), qkv_c[0], qkv_c[1]);
+        }
+        /* Transpose back: [BS, conv_dim, S] -> [BS, conv_dim] */
         for(int b = 0; b < B; b++){
-            for(int c_dim = 0; c_dim < conv_dim; c_dim++){
-                for(int t = 0; t < S; t++){
-                    float v = qkv_c[(int64_t)b*S*conv_dim + (int64_t)c_dim*S + t];
+            for(int t = 0; t < S; t++){
+                int bs = b*S + t;
+                for(int c_dim = 0; c_dim < conv_dim; c_dim++){
+                    float v = qkv_c[(int64_t)bs*conv_dim*S + (int64_t)c_dim*S + t];
                     /* Reference applies F.silu after conv1d */
-                    qkv_all[(int64_t)c_dim*BS + (int64_t)b*S + t] = siluf(v);
+                    qkv_all[(int64_t)bs * conv_dim + c_dim] = siluf(v);
                 }
             }
         }
         free(qkv_c);
     }
 
-    /* 3) Split QKV from the convolved tensor:
-     * Q = first nq*kd channels, V = next nv*vd, K = last nq*kd */
+    /* 3) Split QKV: Q=first nq*kd, K=next nq*kd, V=last nv*vd.
+     * qkv_all is [BS, conv_dim] from matmul — copy per batch element. */
     for(int bs = 0; bs < BS; bs++){
-        float *qo = q_all + (int64_t)bs*nq*kd;
-        float *vo = v_all + (int64_t)bs*nv*vd;
-        float *ko = k_all + (int64_t)bs*nq*kd;
-        const float *qi = qkv_all + (int64_t)bs*conv_dim;
-        memcpy(qo, qi, (int64_t)nq*kd * sizeof(float));
-        memcpy(vo, qi + (int64_t)nq*kd, (int64_t)nv*vd * sizeof(float));
-        memcpy(ko, qi + (int64_t)(nq*kd + nv*vd), (int64_t)nq*kd * sizeof(float));
+        memcpy(q_all + (int64_t)bs * nq * kd, qkv_all + (int64_t)bs * conv_dim, (int64_t)nq * kd * sizeof(float));
+        memcpy(k_all + (int64_t)bs * nq * kd, qkv_all + (int64_t)bs * conv_dim + (int64_t)nq * kd, (int64_t)nq * kd * sizeof(float));
+        memcpy(v_all + (int64_t)bs * nv * vd, qkv_all + (int64_t)bs * conv_dim + (int64_t)2 * nq * kd, (int64_t)nv * vd * sizeof(float));
     }
-
-    /* L2 normalize Q and K per head (like fla.LinearAttention).
-     * ln_w [128] is per-dimension weight applied after L2 norm. */
+    /* NaN check after split - check all arrays thoroughly */
     if(getenv("DEBUG_LINEAR")){
-        float rms_q=0; for(int i=0;i<nq*kd;i++) rms_q+=q_all[i]*q_all[i];
-        fprintf(stderr,"[LIN] L%d: pre_l2_q_rms=%.4f ln_w=%p\n",layer,sqrtf(rms_q/(nq*kd)),(void*)l->ln_w);
-    }
-    if(l->ln_w){
-        for(int bs = 0; bs < BS; bs++){
-            for(int h = 0; h < nq; h++){
-                float *qh = q_all + (int64_t)bs*nq*kd + (int64_t)h*kd;
-                float l2=0; for(int d=0;d<kd;d++) l2 += qh[d]*qh[d];
-                float inv_l2 = (l2 > 0) ? 1.0f/sqrtf(l2+1e-6) : 0; /* L2 norm = sqrt(sum x^2) */
-                if(getenv("DEBUG_LINEAR") && bs==0 && h==0)
-                    fprintf(stderr,"[LIN] L%d: q_l2=%.4f inv_l2=%.4f\n",layer,sqrtf(l2),inv_l2);
-                for(int d=0;d<kd;d++) qh[d] = qh[d] * inv_l2 * l->ln_w[d];
-            }
-            for(int h = 0; h < nq; h++){
-                float *kh = k_all + (int64_t)bs*nq*kd + (int64_t)h*kd;
-                float l2=0; for(int d=0;d<kd;d++) l2 += kh[d]*kh[d];
-                float inv_l2 = (l2 > 0) ? 1.0f/sqrtf(l2+1e-6) : 0;
-                for(int d=0;d<kd;d++) kh[d] = kh[d] * inv_l2 * l->ln_w[d];
-            }
+        int nf=0;
+        for(int bs=0;bs<BS && !nf;bs++) for(int c=0;c<conv_dim && !nf;c++){
+            float v=qkv_all[(int64_t)bs*conv_dim+c];
+            if(v!=v){ nf=1; fprintf(stderr,"[LIN] L%d: NaN@qkv_all[%d,%d]\n",layer,bs,c); }
         }
+        if(!nf) for(int bs=0;bs<BS && !nf;bs++) for(int h=0;h<nq && !nf;h++) for(int d=0;d<kd && !nf;d++){
+            float v=k_all[(int64_t)bs*nq*kd+(int64_t)h*kd+d];
+            if(v!=v){ nf=1; fprintf(stderr,"[LIN] L%d: NaN@k_all[%d,%d,%d]\n",layer,bs,h,d); }
+        }
+        if(!nf) for(int bs=0;bs<BS && !nf;bs++) for(int h=0;h<nq && !nf;h++) for(int d=0;d<kd && !nf;d++){
+            float v=q_all[(int64_t)bs*nq*kd+(int64_t)h*kd+d];
+            if(v!=v){ nf=1; fprintf(stderr,"[LIN] L%d: NaN@q_all[%d,%d,%d]\n",layer,bs,h,d); }
+        }
+        if(!nf) for(int bs=0;bs<BS && !nf;bs++) for(int h=0;h<nv && !nf;h++) for(int d=0;d<vd && !nf;d++){
+            float v=v_all[(int64_t)bs*nv*vd+(int64_t)h*vd+d];
+            if(v!=v){ nf=1; fprintf(stderr,"[LIN] L%d: NaN@v_all[%d,%d,%d]\n",layer,bs,h,d); }
+        }
+        if(!nf) fprintf(stderr,"[LIN] L%d: All arrays NaN-free\n",layer);
     }
 
-    /* 4) Z, A, B projections (from separate weight tensors) */
-    matmul_qt(z_all, x_in, &l->in_proj_z, BS);    /* [nv*vd, D] @ [D, BS] */
-    matmul_qt(a_all, x_in, &l->in_proj_a, BS);    /* [nq, D] @ [D, BS] */
-    matmul_qt(b_all, x_in, &l->in_proj_b, BS);    /* [nq, D] @ [D, BS] */
-    if(getenv("DEBUG_LINEAR")){
-        float rms_z=0; for(int i=0;i<nv*vd;i++) rms_z+=z_all[i]*z_all[i];
-        fprintf(stderr,"[LIN] L%d: z_rms=%.4f a_rms=%.4f b_rms=%.4f\n",layer,sqrtf(rms_z/(nv*vd)),a_all[0],b_all[0]);
-    }
-
-    /* 3) Apply A: exp decay per head
-     * a[t,h] = exp(a_proj[t,h] + dt_bias[h]) * B[t,h] */
+    /* L2 normalize Q and K per head, per batch element. Layout: [BS, nq*kd].
+     * PyTorch: F.normalize(Q, p=2, dim=-1) = x / sqrt(sum(x^2) + eps).
+     * NOTE: Do NOT divide sum-of-squares by kd before sqrt — that would
+     * introduce a spurious √kd scaling factor. Match PyTorch exactly. */
     for(int bs = 0; bs < BS; bs++){
         for(int h = 0; h < nq; h++){
-            float a_val = a_all[(int64_t)bs*nq + h];
+            float l2 = 0;
+            for(int d = 0; d < kd; d++)
+                l2 += q_all[(int64_t)bs*nq*kd + (int64_t)h*kd + d] * q_all[(int64_t)bs*nq*kd + (int64_t)h*kd + d];
+            /* NO l2 /= (float)kd — raw L2 norm like PyTorch F.normalize */
+            float inv_l2 = (l2 > 0) ? 1.0f/sqrtf(l2 + 1e-6f) : 0;
+            for(int d = 0; d < kd; d++)
+                q_all[(int64_t)bs*nq*kd + (int64_t)h*kd + d] *= inv_l2;
+        }
+    }
+    for(int bs = 0; bs < BS; bs++){
+        for(int h = 0; h < nq; h++){
+            float l2 = 0;
+            for(int d = 0; d < kd; d++)
+                l2 += k_all[(int64_t)bs*nq*kd + (int64_t)h*kd + d] * k_all[(int64_t)bs*nq*kd + (int64_t)h*kd + d];
+            /* NO l2 /= (float)kd — raw L2 norm like PyTorch F.normalize */
+            float inv_l2 = (l2 > 0) ? 1.0f/sqrtf(l2 + 1e-6f) : 0;
+            for(int d = 0; d < kd; d++)
+                k_all[(int64_t)bs*nq*kd + (int64_t)h*kd + d] *= inv_l2;
+        }
+    }
+    if(getenv("DEBUG_LINEAR")){
+        float k_rms=0; for(int bs=0;bs<BS;bs++) for(int h=0;h<nq;h++) for(int d=0;d<kd;d++) k_rms += k_all[(int64_t)bs*nq*kd+(int64_t)h*kd+d]*k_all[(int64_t)bs*nq*kd+(int64_t)h*kd+d];
+        fprintf(stderr,"[LIN] L%d: pre_l2_k_rms=%.6f K_raw[0]=%.6f K_raw[1]=%.6f\n",layer,sqrtf(k_rms/(nq*kd*BS)),k_all[0],k_all[1]);
+    }
+
+    /* 4) Z, A, B projections (from separate weight tensors)
+     * matmul produces [BS, dim] layout. */
+    matmul_qt(z_all, x_in, &l->in_proj_z, BS);    /* [BS, nv*vd] */
+    matmul_qt(a_all, x_in, &l->in_proj_a, BS);    /* [BS, nq] */
+    matmul_qt(b_all, x_in, &l->in_proj_b, BS);    /* [BS, nq] */
+    if(getenv("DEBUG_LINEAR")){
+        float rms_z=0; for(int i=0;i<nv*vd;i++) rms_z+=z_all[i]*z_all[i];
+        fprintf(stderr,"[LIN] L%d: z_rms=%.4f z[0]=%.4f a_all[0]=%.4f b_all[0]=%.4f\n",layer,sqrtf(rms_z/(nv*vd)),z_all[0],a_all[0],b_all[0]);
+    }
+
+    /* 5) Compute gating per reference formulas:
+     * beta = sigmoid(b) — multiplicative gate on V
+     * g = -exp(A_log) * softplus(a + dt_bias) — log(alpha), always <= 0
+     * All arrays use matmul layout: [BS, dim] */
+    float *g_all = falloc((int64_t)BS * nq);
+    for(int bs = 0; bs < BS; bs++){
+        for(int h = 0; h < nq; h++){
+            float A = expf(l->A_log[h]);
             float dt = l->dt_bias[h];
+            float a_val = a_all[(int64_t)bs*nq + h];
             float b_val = b_all[(int64_t)bs*nq + h];
-            /* a = exp(a_val + dt) — this is the exponential decay rate */
-            if(a_val + dt > 20) a_all[(int64_t)bs*nq + h] = 1.0f;
-            else if(a_val + dt < -20) a_all[(int64_t)bs*nq + h] = 0.0f;
-            else a_all[(int64_t)bs*nq + h] = expf(a_val + dt) * b_val;
+            /* softplus(a_val + dt) */
+            float gk = a_val + dt;
+            float soft_a = (gk > 20) ? gk : ((gk < -20) ? expf(gk) : gk + logf(1.0f + expf(-fabsf(gk))));
+            /* g = -A * softplus(a + dt) — always <= 0 */
+            g_all[(int64_t)bs*nq + h] = -A * soft_a;
+            /* beta = sigmoid(b) */
+            b_all[(int64_t)bs*nq + h] = 1.0f / (1.0f + expf(-b_val));
         }
     }
 
-    /* 4) Linear attention with recurrence (chunked over time)
-     * y[t] = sum_{t'=0..t} prod_{t''=t'+1..t} A[t''] * V[t']
-     * This is the core of the linear attention: O(N*d^2) instead of O(N^2*d) */
+    /* 6) Linear attention with recurrence (sequential over t).
+     * All arrays use matmul layout [BS, dim].
+     * PyTorch reference: S = exp(g)*S + K*beta*(V - K^T*S) */
     int64_t state_size = (int64_t)nq * kd * vd; /* [nq, kd, vd] state per batch */
     float *state = falloc((int64_t)B * state_size); /* [B, nq, kd, vd] */
     memset(state, 0, (int64_t)B * state_size * sizeof(float));
 
     for(int t = 0; t < S; t++){
-        /* Update state: S[h] = S[h] * a[t,h] + outer(K[t,h], V[t,h]) */
         if(getenv("DEBUG_LINEAR") && t==0){
-            float rms_k=0; for(int i=0;i<nq*kd;i++) rms_k+=k_all[i]*k_all[i];
-            float rms_v=0; for(int i=0;i<nv*vd;i++) rms_v+=v_all[i]*v_all[i];
-            fprintf(stderr,"[LIN] L%d: t=0 k_rms=%.4f v_rms=%.4f\n",layer,sqrtf(rms_k/(nq*kd)),sqrtf(rms_v/(nv*vd)));
-            fprintf(stderr,"[LIN] L%d: a_all[0]=%.4f a_all[1]=%.4f\n",layer,a_all[0],a_all[1]);
+            float rms_k=0; for(int bs=0;bs<BS;bs++) for(int h=0;h<nq;h++) for(int d=0;d<kd;d++) rms_k += k_all[(int64_t)bs*nq*kd+(int64_t)h*kd+d]*k_all[(int64_t)bs*nq*kd+(int64_t)h*kd+d];
+            float rms_v=0; for(int bs=0;bs<BS;bs++) for(int h=0;h<nv;h++) for(int d=0;d<vd;d++) rms_v += v_all[(int64_t)bs*nv*vd+(int64_t)h*vd+d]*v_all[(int64_t)bs*nv*vd+(int64_t)h*vd+d];
+            fprintf(stderr,"[LIN] L%d: t=0 k_rms=%.4f v_rms=%.4f\n",layer,sqrtf(rms_k/(nq*kd*BS)),sqrtf(rms_v/(nv*vd*BS)));
         }
         for(int b = 0; b < B; b++){
             int64_t b_off = (int64_t)b * state_size;
+            int bs = t * B + b;  /* batch-sequence index */
             for(int h = 0; h < nq; h++){
-                float a_val = a_all[(int64_t)(t*B+b)*nq + h];
                 int64_t h_off = (int64_t)h * kd * vd;
-                /* Decay existing state */
+                /* Read g_val and beta from [BS, nq] layout */
+                float g_val = g_all[(int64_t)bs*nq + h];
+                float beta = b_all[(int64_t)bs*nq + h];
+                /* Decay: alpha = exp(g) where g<0 → alpha in (0,1) */
+                float decay = (g_val < -40) ? 0.0f : (g_val > 0) ? 1.0f : expf(g_val);
                 for(int i = 0; i < kd * vd; i++)
-                    state[b_off + h_off + i] *= a_val;
-                /* Add outer product K ⊗ V */
-                const float *kv = k_all + (int64_t)(t*B+b)*nq*kd + (int64_t)h*kd;
-                const float *vv = v_all + (int64_t)(t*B+b)*nv*vd;
-                int vh = h * vd / nq; /* map K head to V head */
+                    state[b_off + h_off + i] *= decay;
+                /* Corrected gated delta rule — matches PyTorch reference:
+                 *   S = decay * S              (done above)
+                 *   kv_mem = K^T @ S           (per output channel)
+                 *   delta = (V - kv_mem) * beta
+                 *   S = S + K * delta */
+                /* K in [BS, nq*kd] layout, V in [BS, nv*vd] layout */
+                const float *kv = k_all + (int64_t)bs*nq*kd + (int64_t)h*kd;
+                int vh = h * nv / nq;
                 if(vh >= nv) vh = nv - 1;
+                const float *vv = v_all + (int64_t)bs*nv*vd + (int64_t)vh*vd;
                 if(getenv("DEBUG_LINEAR") && t==0 && h==0){
-                    fprintf(stderr,"[LIN] L%d: h=0 vh=%d a_val=%.4f\n",layer,vh,a_val);
+                    fprintf(stderr,"[LIN] L%d: h=0 vh=%d bs=%d g=%.4f decay=%.6f beta=%.4f\n",
+                        layer,vh,bs,g_val,decay,beta);
+                }
+                float kv_mem_local[128];
+                for(int j = 0; j < vd; j++){
+                    float km = 0;
+                    for(int i = 0; i < kd; i++)
+                        km += kv[i] * state[b_off + h_off + i*vd + j];
+                    kv_mem_local[j] = km;
                 }
                 for(int i = 0; i < kd; i++)
                     for(int j = 0; j < vd; j++)
-                        state[b_off + h_off + i*vd + j] += kv[i] * vv[(int64_t)vh*vd + j];
+                        state[b_off + h_off + i*vd + j] += kv[i] * (vv[j] - kv_mem_local[j]) * beta;
             }
         }
 
-        /* Compute output: y[t,b,h,j] = sum_i q[t,b,h,i] * S[t,b,h,i,j]
+        /* Compute output: y[bs, h, j] = sum_i q[bs, h, i] * S[bs, h, i, j]
          * Reference: einsum('bhd,bhdm->bhm', q, S)
-         * Each head h maps to output head h (1:1). Output shape [nv, vd]. */
+         * y_all uses [BS, nv*vd] layout. */
         if(getenv("DEBUG_LINEAR") && t==0){
             float rms_state=0; for(int i=0;i<state_size;i++) rms_state+=state[i]*state[i];
-            fprintf(stderr,"[LIN] L%d: t=0 state_rms=%.4f\n",layer,sqrtf(rms_state/state_size));
+            fprintf(stderr,"[LIN] L%d: t=0 state_rms=%.6f\n",layer,sqrtf(rms_state/state_size));
         }
         for(int b = 0; b < B; b++){
             int64_t b_off = (int64_t)b * state_size;
+            int bs = t * B + b;
             for(int h = 0; h < nv; h++){
-                float *yo_h = y_all + (int64_t)(t*B+b)*nv*vd + (int64_t)h*vd;
                 int64_t h_off = (int64_t)h * kd * vd;
-                const float *qh = q_all + (int64_t)(t*B+b)*nq*kd + (int64_t)h*kd;
+                float *yo = y_all + (int64_t)bs * nv * vd + (int64_t)h * vd;
+                const float *qh = q_all + (int64_t)bs * nq * kd + (int64_t)h * kd;
                 const float *sh = state + b_off + h_off;
                 for(int j = 0; j < vd; j++){
                     float acc = 0;
                     for(int i = 0; i < kd; i++)
                         acc += qh[i] * sh[i*vd + j];
-                    yo_h[j] = acc;
+                    yo[j] = acc;
+                    if(getenv("DEBUG_LINEAR") && b==0 && h==nv-1 && j==vd-1){
+                        fprintf(stderr,"[LIN] L%d: y_all[nv*vd-1]=%.6f\n",layer,yo[j]);
+                    }
                 }
             }
         }
     }
 
-    /* 5) Z gating: y = Z * y */
+    /* 7) Z gating + RMSNorm: match Qwen3_5RMSNormGated(core_attn, z)
+     * = RMSNorm(core_attn) * weight * silu(z)
+     * z_all uses [BS, nv*vd] layout from matmul. y_all uses [BS, nv*vd] layout. */
     for(int bs = 0; bs < BS; bs++){
         for(int h = 0; h < nv; h++){
             float *yo = y_all + (int64_t)bs*nv*vd + (int64_t)h*vd;
             const float *zo = z_all + (int64_t)bs*nv*vd + (int64_t)h*vd;
-            for(int d = 0; d < vd; d++)
-                yo[d] = siluf(zo[d]) * yo[d];
+            float rms=0;
+            for(int d=0;d<vd;d++) rms += yo[d]*yo[d];
+            rms = sqrtf(rms/vd + c->eps);
+            float *ln_w = l->ln_w;  /* Qwen3_5RMSNormGated weight, shape [vd] */
+            for(int d = 0; d < vd; d++){
+                float wf = ln_w ? ln_w[d] : 1.0f;
+                yo[d] = (yo[d] / rms * wf) * siluf(zo[d]);
+            }
         }
     }
 
-    /* 6) Output projection: y[B*S, nv*vd] -> out[B*S, D] */
+    /* 8) Output projection: y[BS, nv*vd] -> out[BS, D]
+     * y_all is [BS, nv*vd], o_proj_delta is [D, nv*vd], output is [BS, D]. */
     if(getenv("DEBUG_LINEAR")){
-        float rms_y=0; for(int i=0;i<nv*vd;i++) rms_y+=y_all[i]*y_all[i];
-        fprintf(stderr,"[LIN] L%d: pre_out_y_rms=%.4f\n",layer,sqrtf(rms_y/(nv*vd)));
+        float rms_y=0; for(int bs=0;bs<BS;bs++) for(int h=0;h<nv;h++) for(int d=0;d<vd;d++) rms_y += y_all[(int64_t)bs*nv*vd+(int64_t)h*vd+d]*y_all[(int64_t)bs*nv*vd+(int64_t)h*vd+d];
+        fprintf(stderr,"[LIN] L%d: pre_out_y_rms=%.4f y[0]=%.6f y[1]=%.6f y[2]=%.6f\n",
+            layer,sqrtf(rms_y/(nv*vd*BS)),y_all[0],y_all[1],y_all[2]);
     }
     matmul_qt(out_proj, y_all, &l->o_proj_delta, BS);
     if(getenv("DEBUG_LINEAR")){
-        float rms_out=0; for(int i=0;i<D;i++) rms_out+=out_proj[i]*out_proj[i];
-        fprintf(stderr,"[LIN] L%d: post_out_rms=%.4f\n",layer,sqrtf(rms_out/D));
+        float rms_out=0; for(int bs=0;bs<BS;bs++) for(int i=0;i<D;i++) rms_out+=out_proj[(int64_t)bs*D+i]*out_proj[(int64_t)bs*D+i];
+        fprintf(stderr,"[LIN] L%d: post_out_rms=%.4f\n",layer,sqrtf(rms_out/(BS*D)));
     }
     memcpy(out, out_proj, (int64_t)BS * D * sizeof(float));
     if(getenv("DEBUG_LINEAR")){
@@ -1439,8 +1638,35 @@ static int is_linear_attn_layer(int li, const Cfg *c){
 
 /* ---------- config ---------- */
 static jval* cfg_root(const char *snap, char **arena){
-    char p[2048]; snprintf(p,sizeof(p),"%s/config.json",snap);
-    FILE *f=fopen(p,"rb"); if(!f){perror(p);exit(1);}
+    char p[2048];
+    /* Check if snap is a GGUF file or directory */
+    FILE *f = fopen(snap, "rb");
+    if(f){
+        fclose(f);
+        /* Check file extension */
+        const char *ext = strrchr(snap, '.');
+        if(ext && strcmp(ext, ".gguf") == 0){
+            /* GGUF file: look for config.json in parent directory */
+            char dir[2048];
+            strncpy(dir, snap, sizeof(dir)-1);
+            dir[sizeof(dir)-1] = 0;
+            char *last_slash = strrchr(dir, '/');
+            if(last_slash){
+                *(last_slash+1) = 0;
+            } else {
+                strcpy(dir, "./");
+            }
+            snprintf(p, sizeof(p), "%sconfig.json", dir);
+            fprintf(stderr, "[GGUF] Looking for config.json at: %s\n", p);
+        } else {
+            /* Directory */
+            snprintf(p, sizeof(p), "%s/config.json", snap);
+        }
+    } else {
+        /* Directory */
+        snprintf(p, sizeof(p), "%s/config.json", snap);
+    }
+    f=fopen(p,"rb"); if(!f){perror(p);exit(1);}
     fseek(f,0,SEEK_END); long n=ftell(f); fseek(f,0,SEEK_SET);
     char *b=malloc(n+1); if(fread(b,1,n,f)!=(size_t)n){} b[n]=0; fclose(f);
     return json_parse(b,arena);
@@ -1571,28 +1797,64 @@ static void load_cfg(Cfg *c, const char *snap){
     free(ar);
 }
 
-/* costruisce un QT [O,I] dal disco in `t` (buffer riusabili tra chiamate).
- *  - se esiste `name.qs`: pesi GIA' quantizzati nel container (U8 qdata + F32 scala) -> letti diretti
- *  - altrimenti: tensore pieno (f32/bf16) -> quantizzato a runtime a `bits` (oracolo tiny / pesi pieni)
+/* costruisce un QT [O,I] dal disco GGUF in `t` (buffer riusabili tra chiamate).
+ *  - GGUF contiene gia' i pesi quantizzati (FP16/F32/NVFP4/NVFP8) con scale per-riga
+ *  - gguf_read_tensor() dequantizza on-the-fly senza conversione runtime aggiuntiva
  * drop=1 -> fadvise DONTNEED (streaming expert). */
 static void qt_from_disk(Model *m, const char *name, int O, int I, int bits, int drop, QT *t){
-    char sn[300]; snprintf(sn,sizeof(sn),"%s.qs",name);
-    if(st_has(&m->S,sn)){
-        int64_t nb=st_nbytes(&m->S,name);
-        int fmt = (nb==(int64_t)O*I)?1 : (nb==(int64_t)O*((I+1)/2))?2 : 3;  /* int8 / int4 / int2 dai byte */
-        /* FP4 detection: bits==4 forces fmt=4 even if byte count matches INT4 */
-        if(bits==4 && nb==(int64_t)O*((I+1)/2)) fmt=4;
-        if(fmt==1){ if(t->fmt!=1||!t->q8){ t->fmt=1; t->O=O; t->I=I; t->q8=malloc(nb); t->s=falloc(O); } st_read_raw(&m->S,name,t->q8,drop); }
-        else      { if(t->fmt!=fmt||!t->q4){ t->fmt=fmt; t->O=O; t->I=I; t->q4=malloc(nb); t->s=falloc(O); } st_read_raw(&m->S,name,t->q4,drop); }
-        st_read_f32(&m->S,sn,t->s,drop);
+    gguf_tensor *gt = gguf_find(&m->S, name);
+    if(!gt){ fprintf(stderr,"qt_from_disk: %s not found\n",name); exit(1); }
+    fprintf(stderr,"[INIT] qt_from_disk: %s O=%d I=%d dtype=%d\n", name, O, I, gt->dtype);
+
+    if(!t->qf && !t->q8 && !t->q4) qt_alloc(t,O,I,bits);
+
+    if(gt->dtype == GGML_TYPE_F32){
+        /* F32: read directly to qf */
+        int64_t numel = 0;
+        gguf_read_tensor(&m->S, name, t->qf, &numel);
+        t->fmt = 0;
+    } else if(gt->dtype == GGML_TYPE_F16){
+        /* F16: read and convert to F32 */
+        float *tmp = falloc((int64_t)O*I);
+        if(!tmp){ fprintf(stderr,"[INIT] F16 tmp alloc fail O=%d I=%d\n",O,I); exit(1); }
+        int64_t numel = 0;
+        gguf_read_tensor(&m->S,name,tmp,&numel);
+        /* Always store as F32 regardless of bits (bits only controls quantization of F32 source) */
+        if(!t->qf){ qt_alloc(t,O,I,16); }
+        for(int64_t i=0; i<O*I; i++) t->qf[i] = tmp[i];
+        free(tmp);
+        t->fmt = 0;
+    } else if(gt->dtype == GGML_TYPE_NVFP4){
+        /* NVFP4: dequantize on-the-fly */
+        float *tmp = falloc((int64_t)O*I);
+        int64_t numel = 0;
+        gguf_read_tensor(&m->S,name,tmp,&numel);
+        /* Quantize to int4 for fast matmul */
+        qt_fill(t,tmp,4);
+        free(tmp);
+        t->fmt = 4;
+    } else if(gt->dtype == GGML_TYPE_NVFP8){
+        /* NVFP8: dequantize on-the-fly */
+        float *tmp = falloc((int64_t)O*I);
+        int64_t numel = 0;
+        gguf_read_tensor(&m->S,name,tmp,&numel);
+        /* Quantize to int8 for fast matmul */
+        qt_fill(t,tmp,8);
+        free(tmp);
+        t->fmt = 1;
     } else {
-        if(!t->qf && !t->q8 && !t->q4) qt_alloc(t,O,I,bits);
-        if(t->fmt==0) st_read_f32(&m->S,name,t->qf,drop);
-        else { float *tmp=falloc((int64_t)O*I); st_read_f32(&m->S,name,tmp,drop); qt_fill(t,tmp,bits); free(tmp); }
+        /* Unknown type: read as F32 and quantize */
+        float *tmp = falloc((int64_t)O*I);
+        int64_t numel = 0;
+        gguf_read_tensor(&m->S, name, tmp, &numel);
+        qt_fill(t, tmp, bits);
+        free(tmp);
     }
 }
 static QT qt_load(Model *m, const char *name, int O, int I, int bits){
-    QT t; memset(&t,0,sizeof(t)); qt_from_disk(m,name,O,I,bits,0,&t);
+    QT t; memset(&t,0,sizeof(t));
+    fprintf(stderr,"[INIT] qt_load: memset done qf=%p q8=%p q4=%p\n",t.qf,t.q8,t.q4);
+    qt_from_disk(m,name,O,I,bits,0,&t);
 #ifdef COLI_HIP
     if(g_hip_enabled&&g_hip_dense){
         t.hip_eligible=1;
@@ -1603,20 +1865,39 @@ static QT qt_load(Model *m, const char *name, int O, int I, int bits){
     return t;
 }
 static float *ld(Model *m, const char *name){   /* tensore 1D f32 residente (norme/bias) */
-    int64_t n=st_numel(&m->S,name); if(n<0){fprintf(stderr,"missing %s\n",name);exit(1);}
-    float *p=falloc(n); st_read_f32(&m->S,name,p,0); return p;
+    gguf_tensor *gt = gguf_find(&m->S, name);
+    if(!gt){ fprintf(stderr,"ld: %s not found\n",name); exit(1); }
+    fprintf(stderr,"[INIT] ld: %s dtype=%d\n", name, gt->dtype);
+    int64_t n = 1;
+    for(int d=0; d<gt->ndim; d++) n *= gt->shape[d];
+    float *p = falloc(n);
+    int64_t numel = 0;
+    gguf_read_tensor(&m->S, name, p, &numel);
+    return p;
 }
 /* carica un tensore f32 arbitrario (es. conv1d weight [C,1,K]) dallo shards */
 static float *f32_tensor_load(Model *m, const char *name, int64_t *out_n){
-    int64_t n=st_numel(&m->S,name); if(n<0){fprintf(stderr,"missing %s\n",name);exit(1);}
-    float *p=falloc(n); st_read_f32(&m->S,name,p,0); if(out_n) *out_n=n; return p;
+    gguf_tensor *gt = gguf_find(&m->S, name);
+    if(!gt){ fprintf(stderr,"f32_tensor_load: %s not found\n",name); exit(1); }
+    int64_t n = 1;
+    for(int d=0; d<gt->ndim; d++) n *= gt->shape[d];
+    float *p = falloc(n);
+    int64_t numel = 0;
+    gguf_read_tensor(&m->S, name, p, &numel);
+    if(out_n) *out_n = numel;
+    return p;
 }
 
 static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits){
     fprintf(stderr,"[INIT] starting model_init snap=%s cap=%d\n", snap, cap);
     memset(m,0,sizeof(*m)); m->ebits=ebits; m->dbits=dbits;
     fprintf(stderr,"[INIT] calling load_cfg\n");
-    load_cfg(&m->c,snap); st_init(&m->S,snap);
+    load_cfg(&m->c,snap); 
+    fprintf(stderr,"[INIT] loading from GGUF: %s\n", snap);
+    if(!gguf_init(&m->S, snap)){
+        fprintf(stderr,"[INIT] failed to open GGUF: %s\n", snap);
+        exit(1);
+    }
     fprintf(stderr,"[INIT] cfg loaded\n");
     Cfg *c=&m->c; char nm[256]; int H=c->n_heads, D=c->hidden;
     fprintf(stderr,"[INIT] H=%d D=%d\n", H, D);
@@ -1714,11 +1995,23 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
                 int oO = (int)(on / D);   /* rows of o_proj (output dim) */
                 fprintf(stderr,"[GQA] Layer %d: qO=%d kO=%d vO=%d oO=%d (numel q=%lld k=%lld v=%lld o=%lld)\n",
                        i, qO, kO, vO, oO, (long long)qn, (long long)kn, (long long)vn, (long long)on);
+                /* Print first few q_proj values from GGUF */
+                {
+                    float *tmp = falloc((int64_t)qn);
+                    gguf_read_tensor(&m->S, P("self_attn.q_proj.weight"), tmp, NULL);
+                    fprintf(stderr,"[GQA%d] q_proj_raw[0]=%.6f q_proj_raw[1]=%.6f q_proj_raw[2]=%.6f q_proj_raw[1023]=%.6f\n",
+                        i, tmp[0], tmp[1], tmp[2], tmp[1023]);
+                    float q_rms=0;
+                    for(int j=0;j<qn;j++) q_rms+=tmp[j]*tmp[j];
+                    q_rms=sqrtf(q_rms/qn);
+                    fprintf(stderr,"[GQA%d] q_proj_raw_rms=%.6f\n", i, q_rms);
+                    free(tmp);
+                }
                 int hd = c->head_dim;  /* from config */
                 fprintf(stderr,"[GQA] Layer %d: hd=%d n_kv=%d\n", i, hd, c->n_kv_heads);
                 if(hd <= 0 || qO <= 0 || kO <= 0){ fprintf(stderr,"[ERROR] GQA layer %d: invalid dims hd=%d qO=%d kO=%d\n",i,hd,qO,kO); exit(1); }
                 fprintf(stderr,"[GQA] Layer %d: computing n_q, n_kv...\n", i);
-                int n_q = qO / hd;     /* derive from tensor */
+                int n_q = qO / hd / 2;  /* derive from tensor — q_proj outputs query+gate */
                 int n_kv = kO / hd;    /* derive from tensor */
                 fprintf(stderr,"[GQA] Layer %d: n_q=%d n_kv=%d\n", i, n_q, n_kv);
                 if(n_kv <= 0 || n_q <= 0){ fprintf(stderr,"[ERROR] GQA layer %d: derived n_kv=%d n_q=%d from qO=%d/kO=%d/hd=%d\n",i,n_kv,n_q,qO,kO,hd); exit(1); }
@@ -1948,7 +2241,14 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
 /* embed: dequantizza la riga del token (scala per-riga) in x[hidden] */
 static void embed_row(Model *m, int tok, float *x){
     int D=m->c.hidden; QT *e=&m->embed;
-    if(e->fmt==0){ memcpy(x, e->qf+(int64_t)tok*D, D*sizeof(float)); return; }
+    if(e->fmt==0){
+        /* F32: direct copy */
+        float *src = e->qf + (int64_t)tok*D;
+        for(int i=0;i<D;i++) x[i] = src[i];
+        return;
+    }
+    if(e->fmt==1){ const int8_t *q=e->q8+(int64_t)tok*D; float s=e->s[tok];
+        for(int i=0;i<D;i++) x[i]=(float)q[i]*s; return; }
     if(e->fmt==1){ const int8_t *q=e->q8+(int64_t)tok*D; float s=e->s[tok];
         for(int i=0;i<D;i++) x[i]=(float)q[i]*s; return; }
     if(e->fmt==4){ const uint8_t *q=e->q4+(int64_t)tok*((D+1)/2); float s=e->s[tok];   /* OCP FP4 E2M1 */
@@ -1987,21 +2287,23 @@ static void expert_load(Model *m, int layer, int eid, ESlot *s){
     Cfg *c=&m->c; int I=c->moe_inter, D=c->hidden, b=m->ebits;
     char nm[3][288]; const char *suf[3]={"gate_proj","up_proj","down_proj"};
     for(int k=0;k<3;k++) snprintf(nm[k],sizeof(nm[k]),"model.layers.%d.mlp.experts.%d.%s.weight",layer,eid,suf[k]);
-    char qn[300]; snprintf(qn,sizeof(qn),"%s.qs",nm[0]);
-    if(!st_has(&m->S,qn)){                       /* fallback: tensori pieni, quantizza a runtime */
+    /* Check if pre-quantized weights exist (GGUF always has them) */
+    if(!st_has(&m->S,nm[0])){                       /* fallback: quantizza a runtime */
         qt_from_disk(m,nm[0],I,D,b,g_drop,&s->g);
         qt_from_disk(m,nm[1],I,D,b,g_drop,&s->u);
         qt_from_disk(m,nm[2],D,I,b,g_drop,&s->d);
         s->eid=eid; return;
     }
-    st_tensor *tw[3], *tq[3];
+    gguf_tensor *tw[3], *tq[3];
+    char qsuf[3][400];
     for(int k=0;k<3;k++){
         tw[k]=st_find(&m->S,nm[k]);
-        snprintf(qn,sizeof(qn),"%s.qs",nm[k]); tq[k]=st_find(&m->S,qn);
+        snprintf(qsuf[k],sizeof(qsuf[k]),"%s.scales",nm[k]);
+        tq[k]=st_find(&m->S,qsuf[k]);
         if(!tw[k]||!tq[k]){ fprintf(stderr,"missing %s\n",nm[k]); exit(1); }
     }
-    int64_t wtot=tw[0]->nbytes+tw[1]->nbytes+tw[2]->nbytes;
-    int64_t ftot=(tq[0]->nbytes+tq[1]->nbytes+tq[2]->nbytes)/4;
+    int64_t wtot=_gguf_nbytes(&m->S,nm[0])+_gguf_nbytes(&m->S,nm[1])+_gguf_nbytes(&m->S,nm[2]);
+    int64_t ftot=_gguf_nbytes(&m->S,qsuf[0])+_gguf_nbytes(&m->S,qsuf[1])+_gguf_nbytes(&m->S,qsuf[2]);
     (void)wtot; (void)ftot; /* suppress unused-variable warning when COLI_HIP is defined */
 #ifdef COLI_HIP
     /* HIP/UMA path: mmap each expert tensor. The GPU walks the mmap'd pages directly
@@ -2009,18 +2311,16 @@ static void expert_load(Model *m, int layer, int eid, ESlot *s){
     {
         QT *qt[3]={&s->g,&s->u,&s->d}; int OO[3]={I,I,D}, II[3]={D,D,I};
         for(int k=0;k<3;k++){
-            char qsuf[400]; snprintf(qsuf,sizeof(qsuf),"%s.qs",nm[k]);
-            /* Map weight tensor */
-            void *wmp = st_mmap_tensor(&m->S, nm[k]);
+            gguf_tensor *wt = st_find(&m->S, nm[k]);
+            if(!wt){ fprintf(stderr,"expert mmap: weight %s not found\n",nm[k]); exit(1); }
+            /* Map weight tensor via gguf */
+            void *wmp = gguf_mmap(&m->S, nm[k]);
             if(!wmp){ fprintf(stderr,"mmap weight %s failed\n",nm[k]); exit(1); }
-            /* Map scale tensor */
-            void *smp = st_mmap_tensor(&m->S, qsuf);
-            if(!smp){ fprintf(stderr,"mmap scale %s failed\n",qsuf); exit(1); }
             int64_t nb=tw[k]->nbytes;
             int fmt = (nb==(int64_t)OO[k]*II[k])?1 : (nb==(int64_t)OO[k]*((II[k]+1)/2))?2 : 3;  /* int8/int4/int2 */
             if(b==4 && nb==(int64_t)OO[k]*((II[k]+1)/2)) fmt=4;  /* FP4: same bytes as INT4 */
             qt[k]->fmt=fmt; qt[k]->O=OO[k]; qt[k]->I=II[k]; qt[k]->qf=NULL;
-            qt[k]->q8=(int8_t*)wmp; qt[k]->q4=(uint8_t*)wmp; qt[k]->s=(float*)smp;
+            qt[k]->q8=(int8_t*)wmp; qt[k]->q4=(uint8_t*)wmp; qt[k]->s=wt->scales;  /* scales from GGUF */
         }
         s->slab = (uint8_t*)tw[0]->mmap_ptr; /* store first weight mmap ptr for cleanup */
         s->eid=eid; return;
@@ -2035,43 +2335,30 @@ static void expert_load(Model *m, int layer, int eid, ESlot *s){
         s->slab_cap=wtot+8192;
     }
     if(!s->fslab || ftot > s->fslab_cap){ free(s->fslab); s->fslab=falloc(ftot); s->fslab_cap=ftot; }
-    int ord[3]={0,1,2};                          /* ordina per offset nel file */
-    for(int a=0;a<3;a++) for(int bb=a+1;bb<3;bb++) if(tw[ord[bb]]->off<tw[ord[a]]->off){ int t=ord[a]; ord[a]=ord[bb]; ord[bb]=t; }
-    int contig = tw[ord[0]]->fd==tw[ord[1]]->fd && tw[ord[1]]->fd==tw[ord[2]]->fd
-              && tw[ord[0]]->off+tw[ord[0]]->nbytes==tw[ord[1]]->off
-              && tw[ord[1]]->off+tw[ord[1]]->nbytes==tw[ord[2]]->off;
-    int64_t pos[3]; int done=0;
-    if(contig){
-        int64_t off0=tw[ord[0]]->off;
-        int dfd = g_direct ? st_direct_fd(&m->S, tw[ord[0]]->fd) : -1;
-        if(dfd>=0){                              /* O_DIRECT: offset/len allineati a 4K */
-            int64_t base=off0 & ~4095LL, need=(off0-base)+wtot;
-            int64_t len=(need+4095)&~4095LL;
-            ssize_t r=pread(dfd, s->slab, len, base);
-            if(r>=need){
-                pos[ord[0]]=off0-base; pos[ord[1]]=pos[ord[0]]+tw[ord[0]]->nbytes;
-                pos[ord[2]]=pos[ord[1]]+tw[ord[1]]->nbytes; done=1;
-            }
-        }
-        if(!done){                               /* fallback bufferizzato */
-            if(pread(tw[ord[0]]->fd, s->slab, wtot, off0)!=wtot){ perror("pread expert"); exit(1); }
-            pos[ord[0]]=0; pos[ord[1]]=tw[ord[0]]->nbytes; pos[ord[2]]=tw[ord[0]]->nbytes+tw[ord[1]]->nbytes; done=1;
-        }
-    }
-    if(!done){                                   /* non contigui: 3 pread bufferizzate */
-        int64_t o=0;
-        for(int a=0;a<3;a++){ int k=ord[a];
-            if(pread(tw[k]->fd, s->slab+o, tw[k]->nbytes, tw[k]->off)!=tw[k]->nbytes){ perror("pread expert"); exit(1); }
-            pos[k]=o; o+=tw[k]->nbytes; }
-    }
-    float *fp[3]; int64_t fo=0;                  /* scale (piccole) */
+    /* GGUF expert loading: read weights and scales via gguf_read_tensor */
+    int64_t pos[3]={0,0,0};
+    float *fp[3]; int64_t fo=0;  /* scale buffers */
+    
     for(int k=0;k<3;k++){
-        if(pread(tq[k]->fd, (char*)(s->fslab+fo), tq[k]->nbytes, tq[k]->off)!=tq[k]->nbytes){ perror("pread qs"); exit(1); }
-        fp[k]=s->fslab+fo; fo+=tq[k]->nbytes/4; }
-    if(g_drop){                                  /* scarta subito le pagine: evita che la page
-                                                  * cache in pressione strangoli il throughput */
-        posix_fadvise(tw[ord[0]]->fd, tw[ord[0]]->off, wtot, POSIX_FADV_DONTNEED);
-        for(int k=0;k<3;k++) posix_fadvise(tq[k]->fd, tq[k]->off, tq[k]->nbytes, POSIX_FADV_DONTNEED);
+        int64_t wnb = _gguf_nbytes(&m->S, nm[k]);
+        int64_t qnb = _gguf_nbytes(&m->S, qsuf[k]);
+        
+        /* Read weight tensor */
+        float *tmp_w = falloc(wnb/4);  /* assuming F32 storage */
+        int64_t wn = 0;
+        gguf_read_tensor(&m->S, nm[k], tmp_w, &wn);
+        memcpy(s->slab + pos[k], tmp_w, wnb);
+        free(tmp_w);
+        pos[k+1] = pos[k] + wnb;  /* next expert offset */
+        
+        /* Read scale tensor */
+        int64_t sn = 0;
+        float *tmp_s = falloc(qnb/4);
+        gguf_read_tensor(&m->S, qsuf[k], tmp_s, &sn);
+        memcpy(s->fslab + fo, tmp_s, qnb);
+        fp[k] = s->fslab + fo;
+        fo += qnb/4;
+        free(tmp_s);
     }
     QT *qt[3]={&s->g,&s->u,&s->d}; int OO[3]={I,I,D}, II[3]={D,D,I};
     for(int k=0;k<3;k++){
@@ -2176,8 +2463,9 @@ static inline void pipe_wait(int q){
     while(!atomic_load_explicit(&g_pp.ready[q],memory_order_acquire)) sched_yield();
 }
 
-/* prefetch asincrono dei pesi di un expert (e delle sue scale .qs): avvia il readahead
- * cosi' le letture sincrone successive trovano la page-cache calda. */
+/* prefetch: GGUF usa pread posizionale, nessun prefetch necessario */
+#define st_prefetch(ctx, name) /* no-op: GGUF uses positional pread */
+
 static void expert_prefetch(Model *m, int layer, int eid){
     char nm[300];
     const char *suf[3]={"gate_proj.weight","up_proj.weight","down_proj.weight"};
@@ -2538,9 +2826,20 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
     free(xg); free(gg); free(uu); free(hh); free(rows); free(rw); free(sg); free(su);
 }
 
+/* SwiGLU MLP: out = down(silu(gate) * up), no bias */
 static void dense_mlp(Layer *l, float *x, int S, int D, int I, float *out){
-    // NO-OP
-    for(int64_t i=0;i<(int64_t)S*D;i++) out[i]=x[i];
+    float *gate = falloc((int64_t)S * I);
+    float *up   = falloc((int64_t)S * I);
+    float *gated = falloc((int64_t)S * I);
+    /* gate_proj: [I, D] @ [D, S] -> [I, S] */
+    matmul_qt(gate, x, &l->gate_proj, S);
+    /* up_proj: [I, D] @ [D, S] -> [I, S] */
+    matmul_qt(up, x, &l->up_proj, S);
+    /* silu(gate) * up */
+    for(int64_t i=0;i<(int64_t)S*I;i++) gated[i]=siluf(gate[i])*up[i];
+    /* down_proj: [D, I] @ [I, S] -> [D, S] */
+    matmul_qt(out, gated, &l->down_proj, S);
+    free(gate); free(up); free(gated);
 }
 
 /* LOOKA: predice il top-K del router del layer `target` dallo stato h (residual stream),
@@ -2632,12 +2931,24 @@ static void layer_forward(Model *m, Layer *l, int li, float *x, int S, int pos_b
         if(l->sparse) moe(m,l,li,nrm,S,tmp); else dense_mlp(l,nrm,S,D,c->dense_inter,tmp);
         for(int64_t j=0;j<(int64_t)S*D;j++) x[j]+=tmp[j];
     } else {
-        /* ── Qwen3.6 path: DeltaNet or GQA ──────────────────────────────────── */
-        /* Pre-attention normalization (input_layernorm) — Qwen3.5 uses offset weights */
+        /* ── Qwen3.5/3.6 path: DeltaNet or GQA ────────────────────────────────
+         * PyTorch (modeling_qwen3_5.py):
+         *   residual = hidden_states
+         *   hidden_states = input_layernorm(hidden_states)
+         *   hidden_states = attention(hidden_states)
+         *   hidden_states = residual + hidden_states
+         * So we MUST apply input_layernorm before attention.
+         * The residual add uses the ORIGINAL x (before LN). */
+        
+        /* Save original x for residual add */
+        float *x_orig = falloc((int64_t)S*D);
+        memcpy(x_orig, x, (int64_t)S*D*sizeof(float));
+        
+        /* Apply input_layernorm — Qwen3.5 uses (1+weight)/RMSNorm */
         for(int s=0;s<S;s++) rmsnorm_qw35(nrm+(int64_t)s*D, x+(int64_t)s*D, l->in_ln, D, c->eps);
 
         if(is_delta_layer(li,c)){
-            /* GatedDeltaNet: fixed-state recurrence */
+            /* GatedDeltaNet: projections on LN-normalized input */
             gated_delta_net(m, l, li, nrm, 1, S, pos_base, tmp);
         } else if(li==c->n_layers && c->attn_type==2){
             /* MTP layer (Qwen3.5/3.6): uses GQA-style self-attention */
@@ -2649,18 +2960,46 @@ static void layer_forward(Model *m, Layer *l, int li, float *x, int S, int pos_b
             /* Qwen3.5/3.6 Linear Attention: causal conv + linear attention */
             linear_attn_forward(m, l, li, nrm, 1, S, pos_base, tmp);
         } else {
-            /* Fallback: use MLA attention (shouldn't happen for Qwen3.6) */
+            /* Fallback: use MLA attention */
             attention(m,l,li,nrm,S,pos_base,tmp);
         }
-        /* Residual add */
-        for(int64_t j=0;j<(int64_t)S*D;j++) x[j]+=tmp[j];
+        /* Residual add: x = original + attention_output */
+        for(int64_t j=0;j<(int64_t)S*D;j++) x[j] = x_orig[j] + tmp[j];
+        free(x_orig);
+
+        if(getenv("DEBUG_LAYER")){
+            /* Post-attention RMS (before residual add) */
+            float rms_attn=0;
+            for(int j=0;j<D;j++) rms_attn+=tmp[j]*tmp[j];
+            rms_attn=sqrtf(rms_attn/D);
+            /* Post-attention + residual RMS */
+            float rms_x=0;
+            for(int j=0;j<D;j++) rms_x+=x[j]*x[j];
+            rms_x=sqrtf(rms_x/D);
+            fprintf(stderr,"[LAY%d] attn_out_rms=%.4f post_resid_rms=%.4f x[0]=%.4f\n",
+                li, rms_attn, rms_x, x[0]);
+        }
 
         /* Post-attention normalization (post_attention_layernorm) — Qwen3.5 offset weights */
         for(int s=0;s<S;s++) rmsnorm_qw35(nrm+(int64_t)s*D, x+(int64_t)s*D, l->post_ln, D, c->eps);
 
+        if(getenv("DEBUG_LAYER")){
+            float rms_postln=0;
+            for(int j=0;j<D;j++) rms_postln+=nrm[j]*nrm[j];
+            rms_postln=sqrtf(rms_postln/D);
+            fprintf(stderr,"[LAY%d] post_ln_rms=%.4f\n", li, rms_postln);
+        }
+
         /* MLP: MoE routing or dense */
         fprintf(stderr,"[LAYFWD] layer %d: mlp_sparse=%d\n", li, l->sparse);
         if(l->sparse) moe(m,l,li,nrm,S,tmp); else dense_mlp(l,nrm,S,D,c->dense_inter,tmp);
+        if(getenv("DEBUG_LAYER")){
+            float rms_mlp=0, absmx_mlp=0;
+            for(int j=0;j<D;j++){ float v=tmp[j]*tmp[j]; rms_mlp+=v; if(v>absmx_mlp)absmx_mlp=v; }
+            rms_mlp=sqrtf(rms_mlp/D);
+            fprintf(stderr,"[LAY%d] mlp_out_rms=%.4f mlp_absmx=%.4f mlp[0]=%.4f\n",
+                li, rms_mlp, sqrtf(absmx_mlp), tmp[0]);
+        }
         for(int64_t j=0;j<(int64_t)S*D;j++) x[j]+=tmp[j];
     }
 }
@@ -2673,9 +3012,19 @@ static void layers_forward(Model *m, float *x, int S, int pos_base){
         if(S>=8 && (i%4==0 || i==c->n_layers-1))
             fprintf(stderr,"[prefill] layer %d/%d · %d token\n", i+1, c->n_layers, S);
         layer_forward(m,&m->L[i],i,x,S,pos_base,nrm,tmp);
+        if(getenv("DEBUG_LAYER")){
+            float rms=0, absmx=0;
+            for(int j=0;j<D;j++){
+                float v=x[j]*x[j]; rms+=v; if(v>absmx)absmx=v;
+            }
+            rms=sqrtf(rms/D); absmx=sqrtf(absmx);
+            fprintf(stderr,"[LAYER%d] rms=%.4f absmx=%.4f x[0]=%.4f x[1]=%.4f x[2]=%.4f x[3]=%.4f x[4]=%.4f\n",
+                i, rms, absmx, x[0], x[1], x[2], x[3], x[4]);
+        }
     }
     free(nrm); free(tmp);
 }
+
 
 static void kv_alloc(Model *m, int max_t){
     Cfg *c=&m->c;
@@ -3164,7 +3513,15 @@ static void run_replay(Model *m, const int *full, int nfull, int np){
 /* generazione reale: tokenizza PROMPT, prefill + decode greedy con stop su EOS,
  * detokenizza e stampa il testo in streaming. */
 static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
-    Cfg *c=&m->c; char tkp[2048]; snprintf(tkp,sizeof(tkp),"%s/tokenizer.json",snap);
+    Cfg *c=&m->c; char tkp[2048];
+    /* For GGUF files, extract directory from snap path */
+    if(strstr(snap, ".gguf")){
+        char dir[2048]; strncpy(dir,snap,sizeof(dir)-1); dir[sizeof(dir)-1]=0;
+        char *sl=strrchr(dir,'/'); if(sl) *sl=0; else strcpy(dir,".");
+        snprintf(tkp,sizeof(tkp),"%s/tokenizer.json",dir);
+    } else {
+        snprintf(tkp,sizeof(tkp),"%s/tokenizer.json",snap);
+    }
     Tok T; tok_load(&T,tkp);
     int eos=tok_id_of(&T,"<|endoftext|>");
     stops_arm(&m->c, eos);
@@ -3389,7 +3746,15 @@ static void serve_ctx_free(Model *m, ServeCtx *s){
 }
 
 static void run_serve(Model *m, const char *snap){
-    char tkp[2048]; snprintf(tkp,sizeof(tkp),"%s/tokenizer.json",snap);
+    char tkp[2048];
+    /* For GGUF files, extract directory from snap path */
+    if(strstr(snap, ".gguf")){
+        char dir[2048]; strncpy(dir,snap,sizeof(dir)-1); dir[sizeof(dir)-1]=0;
+        char *sl=strrchr(dir,'/'); if(sl) *sl=0; else strcpy(dir,".");
+        snprintf(tkp,sizeof(tkp),"%s/tokenizer.json",dir);
+    } else {
+        snprintf(tkp,sizeof(tkp),"%s/tokenizer.json",snap);
+    }
     Tok T; tok_load(&T,tkp);
     int eos=tok_id_of(&T,"<|endoftext|>");
     stops_arm(&m->c, eos);

@@ -1,7 +1,7 @@
 # Implementation Plan: HIP + mmap + FP4 for Qwen3.6 on Strix Halo (gfx1151)
 
-> **Quick Status** (updated July 13, 2026): 5 of 8 phases done (62.5%).
-> Phases 1-7 complete. Phase 8: Qwen3.5 end-to-end runs, numerical accuracy debugging needed.
+> **Quick Status** (updated July 15, 2026): 6 of 8 phases done (75%).
+> Phases 1-8.4 complete. Phase 8.3: Numerical accuracy debugging — C vs PyTorch comparison needed.
 
 ## Executive Summary
 
@@ -10,13 +10,13 @@ Migrate this GLM-5.2 inference engine to support:
 2. ✅ **HIP backend** (AMD ROCm) replacing CUDA — **Phase 1**
 3. ✅ **mmap-based weight loading** (GPU walks file pages directly — zero copy) — **Phase 2**
 4. ✅ **GGUF FP4** quantization (E2M1 format, MXFP4/NVFP4) — **Phase 3** (indexer) / **Phase 4** (quant)
-5. ⬜ **RDNA4 FP4 hardware acceleration** (no hardware on gfx1151, using software) — **Phase 6**
-6. ⬜ **GGUF FP4 conversion tooling** (Python scripts) — **Phase 7**
-7. 🟡 **Integration, testing, benchmarking** (Qwen3.5 runs end-to-end; numerical accuracy debugging) — **Phase 8**
+5. ✅ **RDNA4 FP4 hardware acceleration** (no hardware on gfx1151, using software) — **Phase 6**
+6. ✅ **GGUF FP4/FP8/FP16 conversion tooling** (Python scripts) — **Phase 7**
+7. 🟡 **Integration, testing, benchmarking** (Qwen3.5 runs end-to-end from GGUF; numerical accuracy debugging) — **Phase 8**
 
 **Total estimated effort**: ~20-25 engineer-weeks, with phases of highly variable difficulty.
 
-**Current status**: 5 of 8 phases done (62.5%). 3 phases remaining (6-8).
+**Current status**: 6 of 8 phases done (75%). 2 phases remaining (7-8 partial).
 
 ---
 

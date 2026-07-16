@@ -13,7 +13,103 @@
 | 7 | Qwen3.5 linear attention kernel + GGUF FP4 tool | ✅ Done |
 | 8.1 | Crash fixes (8 bugs) | ✅ Done |
 | 8.2 | Tokenizer format fix | ✅ Done |
-| 8.3 | Numerical accuracy — output quality | 🔴 Needs more work |
+| 8.3 | Numerical accuracy — output quality | 🟡 In progress (major layout fix applied) |
+| 8.4 | GGUF integration (FP16/FP8/FP4) | ✅ Done |
+
+## Phase 8.4 — GGUF Integration (Done 2026-07-15)
+
+### What Was Implemented
+1. **GGUF v3 parser** — Complete `gguf.h` with:
+   - `gguf_init()`, `gguf_find()`, `gguf_mmap()`, `gguf_unmap()`, `gguf_free()`
+   - F32, F16, NVFP4, NVFP8 data types
+   - Pre-quantized tensor dequantization on-the-fly
+
+2. **Hash table bug fix** — `hidx` array allocated with `calloc` (init to 0) but lookup expects -1 for empty slots.
+   **Fix**: Added `memset(ctx->hidx, -1, ctx->hcap * sizeof(int))`.
+
+3. **KV pair type handling** — Fixed to match GGUF v3 spec:
+   - Type 0 = BOOL (1 byte)
+   - Type 2 = STRING (Q + data)
+   - Type 5 = U32 (4 bytes)
+   - Type 7 = F32 (4 bytes)
+
+4. **Tensor info parsing** — Removed placeholder offset from tensor info (GGUF v3 stores offsets in separate section).
+
+5. **Tokenizer path for GGUF** — Updated to extract directory from GGUF file path.
+
+6. **Config path for GGUF** — Updated `cfg_root()` to handle `.gguf` file paths.
+
+### Results
+- **GGUF loading**: ✅ All 488 tensors loaded correctly from `model.gguf` (FP16, 1.7 GB)
+- **Forward pass**: ✅ Runs through all 24 layers + MTP
+- **Generation**: ⚠️ Output quality poor — "The!!!!!!!!!!!!!!!!!!!!" (numerical accuracy issue)
+- **Performance**: 4.84 tok/s, 3.38 GB RSS
+
+### Remaining Work
+- Numerical accuracy: C output doesn't match PyTorch reference
+- First step: Compare per-layer outputs to identify where divergence starts
+- PyTorch reference: Coherent English ("The following are multiple choice...")
+- C output: "The on the floor" (with FP16: "luftiscoitek")
+
+---
+
+## Phase 8.3 — Fix: Memory Layout Bug in Linear Attention (2026-07-15)
+
+### Critical Bug Found and Fixed
+
+**ROOT CAUSE**: The matmul output uses `[head, BS]` layout, but the gating code read/wrote `[bs, head]` layout.
+
+The `matmul_qt(a_all, x_in, &l->in_proj_a, BS)` produces:
+- Layout: `[nq, BS]` = `[16, 3]` → indices: `a_all[h * BS + bs]`
+- The gating code incorrectly accessed: `a_all[bs * nq + h]`
+
+For BS=3, nq=16:
+- Correct: `[0,0]=0, [0,1]=1, [0,2]=2, [1,0]=16, [1,1]=17, ...`
+- Wrong:    `[0,0]=0, [0,1]=1, [0,2]=2, [0,3]=3, ..., [0,15]=15, [1,0]=16`
+
+For small BS values these layouts overlap at indices 0-2 but diverge completely for indices 3-15.
+
+### Fixes Applied
+
+1. **Linear attention — QKV split layout fix**: Changed from `[bs, dim]` to `[head, BS]` matmul layout
+2. **Linear attention — L2 normalization layout fix**: Q and K L2 norm now uses correct `[head, BS]` indexing  
+3. **Linear attention — Gating layout fix**: `g_all` and `b_all` computed with correct `[head, BS]` layout
+4. **Linear attention — State recurrence layout fix**: `g_all`, `b_all`, `k_all`, `v_all` accessed with `[head * dim * BS + bs * dim + d]` indexing
+5. **Linear attention — Y_all layout fix**: Output written in `[head, BS]` layout matching matmul
+6. **GQA attention — Q-projection gate split**: Q_proj outputs query+gate combined, now split correctly
+7. **GQA attention — Per-head scores**: Each head has its own attention distribution (not summed)
+8. **GQA attention — K normalization**: Uses `k_norm_w_gqa` with `(1+w)` offset (was using zeros-falloc'd array)
+9. **GQA attention — Head count fix**: `n_q = qO / hd / 2` (gate takes half of q_proj output)
+10. **GGUF — Directory auto-detection**: Added `.gguf` file lookup when snap path is a directory
+
+### Results
+
+| Test | Before Fix | After Fix |
+|------|-----------|-----------|
+| L0 out_rms | 0.0018 | ~0.0018 (FP16) |
+| g_val sign | sometimes positive | always <= 0 (verified) |
+| Token diversity | single repeated token | diverse tokens |
+| C output (int8) | "kis" | "itek" |
+| C output (FP16) | N/A | "luftiscoitek" |
+| PyTorch output | N/A | "on the floor" |
+
+### Remaining Issues
+
+1. **Numerical accuracy**: C layer outputs have much lower RMS than PyTorch (0.0018 vs 0.041 for L0). This could be from:
+   - The GGUF weight loading (F16→F32 conversion accuracy)
+   - The conv1d output being smaller than PyTorch
+   - The z-gate values being too small
+2. **MTP speculation**: 0% acceptance rate — speculative tokens don't match main model
+3. **Output tokens**: C generates "itek" vs PyTorch generates "on" (first generated token)
+
+### Key Files
+- `c/gguf.h` — GGUF v3 parser (250 lines)
+- `c/tools/convert_to_gguf.py` — Python GGUF writer (FP16/FP8/FP4)
+- `c/glm.c` — Updated for GGUF weight loading
+
+---
+
+## Phase 8.3 — Numerical Accuracy (IN PROGRESS)
 
 ---
 
@@ -59,27 +155,42 @@ left and right tokens at the last space.
 
 ## Phase 8.3 — Numerical Accuracy (IN PROGRESS)
 
-### Latest Progress (2026-07-14)
+### Latest Progress (2026-07-15)
 
-**Critical Bug Fixes Applied:**
-1. **Qwen3.5 RMSNorm offset weights** — Added `rmsnorm_qw35()` that applies `(1.0 + weight)` instead of raw `weight`. PyTorch's `Qwen3_5RMSNorm` uses `weight = nn.Parameter(torch.zeros(dim))` and forward is `output = _norm(x) * (1.0 + weight)`. This was causing all layer norm outputs to be wrong.
-2. **F.silu after conv1d** — Added silu activation after conv1d in `linear_attn_forward()`, matching the reference.
-3. **softplus helper** — Added numerically stable softplus for alpha computation.
+**GGUF Integration Complete:**
+- All 488 tensors load correctly from GGUF FP16 (1.7 GB)
+- Forward pass runs through all layers
+- Output: "The!!!!!!!!!!!!!!!!!!!!" (single repeated token)
+
+**Previous Fixes (2026-07-14):**
+1. **Qwen3.5 RMSNorm offset weights** — Added `(1.0 + weight)` pattern matching PyTorch
+2. **F.silu after conv1d** — Added silu activation after conv1d
+3. **softplus helper** — Numerically stable softplus for alpha
+4. **Conv1d weight indexing** — Fixed reversed kernel order
+5. **K/V split order** — Fixed K/V channel order
+6. **Z gating + RMSNorm** — Added proper RMSNormGated
+7. **L2 normalization** — Removed head_scale multiplier
+8. **Dense MLP** — Implemented SwiGLU forward (was NO-OP)
+9. **Gating computation** — Fixed to -exp(A_log) * softplus(a + dt_bias)
+10. **Alpha decay** — Fixed to use exp(g) where g is negative
 
 **Current Status:**
-- Model now produces NON-ZERO activations ✓
-- Layer norm outputs are now correct (RMS ~1.22 vs expected ~1.0-1.2) ✓
-- Model generates tokens but produces INCOHERENT mixed-language output
+- Model loads and runs end-to-end ✓
+- Output is a single repeated token (!!!!!!!!!!!!!!)
+- PyTorch produces coherent English ✓
+- The model is NOT producing coherent text
 
-**Comparison:**
-- PyTorch: "The cat sat on the floor" (coherent English)
-- C: "The cat sat canoeadou敢于好用(BigDecimal señora conferencias" (gibberish)
+**Key Observation:**
+- All layers produce output (no zeros)
+- But the output logits are degenerate (one token has near-100% probability)
+- This suggests numerical errors in early layers that amplify through the network
 
-**Remaining Issues:**
-- Linear attention kernel output quality — Q/K normalization, state accumulation, or RoPE may be incorrect
-- MLP output quality  
-- Weight loading verification for some tensors
-- Alpha/gating computation may still not match reference pattern
+**Next Debugging Step:**
+1. Compare Layer 0 outputs between C and PyTorch (qkv_all, conv1d_out, Q/K norms)
+2. Compare Layer 1 outputs (should match if L0 is correct)
+3. Identify first layer where outputs diverge
+4. Fix the divergent layer
+5. Iterate until C output matches PyTorch
 
 ### Next Steps (pick up from here after restart)
 
@@ -96,7 +207,6 @@ left and right tokens at the last space.
 
 3. **Compare with PyTorch reference**:
    ```bash
-   python3 c/torch_test.py --prompt "The cat sat" --save c/pytorch_ref.json
    # Then run C with same prompt and compare logits
    ```
 
@@ -197,7 +307,6 @@ SNAP="../Qwen3.5-0.8B" DEBUG_LINEAR=1 PROMPT="The" NGEN=1 ./glm 64 8 8
 
 Compare against PyTorch reference:
 ```bash
-python3 c/torch_test.py --prompt "The cat sat" --save c/pytorch_ref.json
 # Compare c/pytorch_ref.json with C output
 ```
 
@@ -303,17 +412,14 @@ Model runs end-to-end and generates text, but output quality is poor:
 - [ ] **PyTorch reference comparison** — PyTorch IS installed (2.11.0+rocm7.13.0, ROCm gfx1151).
   PyTorch generates coherent English:
   ```
-  $ python3 c/torch_test.py --prompt "The cat sat" --ngenerate 3
   on the floor, and the cat sat on the floor.
 The cat
   ```
   **ACTION**: Compare C vs PyTorch per-token logits:
-  1. `python3 c/torch_test.py --prompt "The cat sat" --save c/pytorch_ref.json`
   2. Run C with same prompt and compare logits
   3. Identify first layer where outputs diverge
   4. Fix the offending layer
 
-- [ ] **PyTorch reference script** — `c/torch_test.py` provides:
   - Greedy and temperature-based generation
   - Top-5 vocabulary with logits and probabilities
   - JSON output for comparison (`--save c/pytorch_ref.json`)
@@ -429,3 +535,50 @@ When the user restarts pi.dev after installing torch:
    ```
 4. **Continue from**: Phase 8.3 numerical accuracy — the TODO item at top of this file
 5. **Do NOT commit/push** without explicit user request
+
+## 2026-07-14: Qwen3.5 Linear Attention Fixes + GGUF Conversion
+
+### Critical Fixes Applied
+1. **Conv1d weight indexing**: Fixed reversed kernel order to match PyTorch padding=3 semantics
+2. **K/V split order**: Fixed K/V channel order (was swapped)
+3. **Z gating + RMSNorm**: Added proper RMSNormGated (was missing)
+4. **L2 normalization**: Removed head_scale multiplier from Q/K normalization (PyTorch doesn't use it)
+5. **Dense MLP**: Implemented SwiGLU forward (was NO-OP)
+6. **Gating computation**: Fixed to use -exp(A_log) * softplus(a + dt_bias) pattern
+7. **Alpha decay**: Fixed to use exp(g) where g is negative (was using exp(a+dt)*b)
+
+### Verification Status
+- Q/K RMS matches PyTorch: 0.1234 vs 0.1230 (Q), 0.0541 vs 0.0542 (K)
+- conv1d output matches PyTorch: -0.0622 vs -0.0613 (within quantization error)
+- conv1d weights match: [-0.0002, 0.0004, -0.0034, -0.0742]
+
+### GGUF Conversion Tool (NEW)
+- Created `c/tools/convert_to_gguf.py`: Full safetensors→GGUF converter
+- Supports FP16 (lossless), FP8-E4M3 (2x compression), FP4-E2M1 (4x compression)
+- Pre-quantizes weights at conversion time → zero runtime quantization
+- Updated `c/gguf.h`: Added NVFP8 type, gguf_read_tensor() with dequantization
+- **Results**: 
+  - FP16 GGUF: 1.7 GB (873M params)
+  - FP8 GGUF: 973 MB (55% of FP16, 873M params quantized)
+  - Conversion time: ~10 seconds for full model
+
+### Output Quality Progress
+- **Before fixes**: Chinese characters, Arabic, gibberish
+- **After L2 fix**: English words ("dermat_rank", "平缓生生的") but not coherent
+- The model now generates English tokens, but the grammar and context are wrong
+- Root cause: int8 quantization of in_proj_qkv introduces errors that propagate through attention
+- **New**: GGUF FP16 weights should eliminate quantization errors
+
+### Remaining Issue
+- The attention Q·K dot product differs from PyTorch due to numerical precision errors
+- The conv1d input values (qkv_all) are different from PyTorch due to int8 quantization
+- **Next step**: Test GGUF FP16 loading in C application to verify output quality
+- If GGUF FP16 produces coherent English, the fix is complete
+
+### Comparison with PyTorch
+| Token | PyTorch | C Code (dbits=16) |
+|-------|---------|--------|
+| "The" | "following are multiple choice..." | "dermat_rank" (English but not coherent) |
+| "The cat sat" | "on the mat" | "dermat_rank" |
+| Quality | Coherent English | English words, wrong context |
+
