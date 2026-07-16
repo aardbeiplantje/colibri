@@ -1,358 +1,285 @@
-# Implementation Plan: HIP + mmap + FP4 for Qwen3.6 on Strix Halo (gfx1151)
+# Colibri — Implementation Plan & Current Status
 
-> **Quick Status** (updated July 15, 2026): 6 of 8 phases done (75%).
-> Phases 1-8.4 complete. Phase 8.3: Numerical accuracy debugging — C vs PyTorch comparison needed.
-
-## Executive Summary
-
-Migrate this GLM-5.2 inference engine to support:
-1. ✅ **Qwen3.6-35B-A3B** model (DeltaNet + MoE architecture) — **Phase 5** — DeltaNet + GQA kernels
-2. ✅ **HIP backend** (AMD ROCm) replacing CUDA — **Phase 1**
-3. ✅ **mmap-based weight loading** (GPU walks file pages directly — zero copy) — **Phase 2**
-4. ✅ **GGUF FP4** quantization (E2M1 format, MXFP4/NVFP4) — **Phase 3** (indexer) / **Phase 4** (quant)
-5. ✅ **RDNA4 FP4 hardware acceleration** (no hardware on gfx1151, using software) — **Phase 6**
-6. ✅ **GGUF FP4/FP8/FP16 conversion tooling** (Python scripts) — **Phase 7**
-7. 🟡 **Integration, testing, benchmarking** (Qwen3.5 runs end-to-end from GGUF; numerical accuracy debugging) — **Phase 8**
-
-**Total estimated effort**: ~20-25 engineer-weeks, with phases of highly variable difficulty.
-
-**Current status**: 6 of 8 phases done (75%). 2 phases remaining (7-8 partial).
+> **Last updated**: 2026-07-16  
+> **Active branch**: `hip-uma-gfx1151`  
+> **Target hardware**: AMD Strix Halo (gfx1151, RDNA4) via ROCm HIP  
+> **Primary model**: Qwen3.5-0.8B (linear attention + GQA)
 
 ---
 
-## Completed (Phase 1-4)
+## Quick Status
 
-### Phase 1: CUDA → HIP port ✅
-- `c/backend_cuda.cu` → `c/backend_hip.cu` (all `cuda*`→`hip*`)
-- `c/backend_cuda.h` → `c/backend_hip.h`
-- `c/tests/test_backend_cuda.cu` → `c/tests/test_backend_hip.cu`
-- `c/glm.c` — all `COLI_CUDA`→`COLI_HIP`, `ColiCudaTensor`→`ColiHipTensor`
+| Component | Status |
+|---|---|
+| **GLM-5.2 MLA** (CPU) | ✅ Production — token-exact vs PyTorch |
+| **Expert MoE routing** | ✅ Streaming from disk, LRU cache |
+| **MTP speculative decoding** | ✅ int8 heads, 2.2-2.8 tok/forward |
+| **Grammar-forced drafts** | ✅ GBNF, ~1.0 acceptance on structured output |
+| **CUDA backend** | ✅ Pinned expert tier |
+| **HIP/ROCm gfx1151** | ✅ Compiles, mmap zero-copy |
+| **FP4 OCP E2M1** | ✅ CPU + GPU kernels, 40/40 tests |
+| **GGUF v3 parser** | ✅ Loads 488 tensors (F32/F16/NVFP4/NVFP8) |
+| **Safetensors → GGUF converter** | ✅ FP16 (lossless), FP8-E4M3, FP4-E2M1 |
+| **Qwen3.5 end-to-end** | 🟡 **Broken — numerical accuracy** |
+| **Qwen3.5 Linear Attention** | 🟡 Runs but "The!!!!!!!!!" |
+| **Qwen3.5 GQA** | 🟡 Runs but not matching PyTorch |
+
+---
+
+## Phase 1: CUDA → HIP Port ✅
+
+- `c/backend_hip.cu` — all `cuda*` → `hip*`
 - `c/Makefile` — `HIP=1`, `hipcc`, `-lamdhip64`
-- **Result**: `make` (CPU-only) and `make HIP=1` (AMD ROCm) both compile clean, zero warnings
+- **Result**: `make` and `make HIP=1` compile clean
 
-### Phase 2: PCIe → UMA mmap ✅
-- `c/backend_hip.cu` — `cudaMalloc`+`cudaMemcpy` → `hipHostRegisterMapped`+`hipHostGetDevicePointer`
-- `c/st.h` — added `mmap_ptr` field, `st_mmap_tensor()`, `st_mmap_slice()`, `st_unmap_tensor()`
-- `c/glm.c` — `expert_load()` branches on `COLI_HIP` for mmap path
-- **Result**: Data flow: `disk → mmap → hipHostRegisterMapped → GPU walks shared RAM` (0 copies, 2× memory savings)
+## Phase 2: PCIe → UMA mmap ✅
 
-### Phase 3: GGUF indexer ✅
-- `c/gguf.h` — minimal ~200 line header-only GGUF v3 parser
-  - `gguf_init()`, `gguf_find()`, `gguf_mmap()`, `gguf_unmap()`, `gguf_free()`
-  - Supports F32, F16, BF16, Q4_0, NVFP4 data types
-- `c/tests/test_gguf.c` — creates minimal GGUF file, reads tensors, verifies values
-- **Result**: Compiles and runs. Can be swapped into `glm.c` to replace `st.h` safetensors path.
+- `hipHostRegisterMapped` + `hipHostGetDevicePointer`
+- GPU walks shared RAM directly — zero copies, 2× memory savings
+- `disk → mmap → GPU` data flow
 
-### Phase 4: OCP FP4 E2M1 Quantization Pipeline ✅
-- **`c/glm.c`** — Complete FP4 quantization and inference pipeline:
-  - `pack_fp4()`: OCP FP4 E2M1 quantizer, scale=absmax/6.0
-  - `matmul_fp4()`: FP4 matrix multiply with OCP decode
-  - `embed_row()`: FP4 dequant for token embedding lookup
-  - `qt_addrow()`, `qt_matvec_rows()`: FP4 accumulation/matvec
-  - `qt_alloc()`, `qt_fill()`, `qt_bytes()`: fmt=4 routing
-  - `qt_from_disk()`, `expert_load()`: FP4 dtype detection
-  - `matmul_qt()`: FP4 dispatch
-- **`c/backend_hip.cu`** — GPU FP4 support:
-  - `fp4_e2m1_decode()`: OCP FP4 E2M1 device function
-  - `weight_at()`: fmt=4 branch with 4-bit E2M1 dequant
-  - `row_bytes()`: fmt=4 returns `(I+1)/2`
-- **`c/gguf.h`** — `GGML_TYPE_NVFP4 = 40` already defined
-- **`c/tests/test_fp4.c`** — 40/40 tests pass (encode/decode round-trip, OCP spec values)
+## Phase 3: GGUF Indexer ✅
 
-**OCP FP4 E2M1 Spec Used:**
-| Aspect | Value |
-|--------|-------|
-| Bit layout | sign(bit3) + exp(bits2-1) + mant(bit0) = 4 bits |
-| Packing | 2 values per byte (LSB-first) |
-| Formula | `(1 + mant/2) × 2^(exp-1)`, bias=1. Subnormal: mant/2 |
-| Positive values | 0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0 |
-| Max representable | ±6.0 |
-| Scale | absmax / 6.0 |
+- `c/gguf.h` — ~250 line header-only GGUF v3 parser
+- `gguf_init()`, `gguf_find()`, `gguf_mmap()`, `gguf_unmap()`, `gguf_free()`
+- Supports F32, F16, BF16, NVFP4, NVFP8 data types
 
----
+## Phase 4: FP4 Quantization Pipeline ✅
 
-## Pending (Phase 6-8)
+- **CPU**: `pack_fp4()`, `matmul_fp4()`, `embed_row()`, FP4 matvec
+- **GPU**: `fp4_e2m1_decode()` in `backend_hip.cu`
+- **Self-test**: `c/tests/test_fp4.c` — 40/40 tests pass
 
-| Phase | Title | Status | Notes |
-|-------|-------|--------|-------|
-| **6** | RDNA4 FP4 hardware | ✅ Researched | No FP4 on RDNA4 — software dequant (Phase 4) is correct |
-| **7** | GGUF FP4 conversion tooling | ⬜ Next | Needs Qwen3.6 model weights + Python scripts |
-| **8** | Integration & benchmarking | ⬜ Last | End-to-end: GGUF → mmap → kernels → tokens |
+## Phase 5: Qwen3.6 Model (DeltaNet + GQA) ✅
 
----
-
-## Quick start for GPU-only on Strix Halo (without Qwen3.6)
-
-```bash
-# Build CPU-only (original GLM path, unchanged)
-make
-
-# Build HIP+mmap (GPU-only inference via unified memory)
-make HIP=1
-
-# Run with mmap'd weights (GPU walks disk pages directly)
-SNAP=./glm_tiny HIP=1 COLI_HIP=1 ./glm 16 4 4
-```
-
-### What this gives you right now:
-- ✅ Zero-copy weight loading via mmap on AMD ROCm
-- ✅ 2× memory savings (no slab buffer + no VRAM copy)
-- ✅ Works with any safetensors model (GLM-5.2 path, Qwen3.6 kernels ready)
-- ✅ FP4 quantization (OCP E2M1) — encode and dequant verified (40/40 tests pass)
-- ✅ DeltaNet + GQA attention kernels — Phase 5 COMPLETE
-- ✅ RDNA4 FP4 hardware analysis — Phase 6 RESEARCHED (no hardware on gfx1151)
-- ⬜ End-to-end Qwen3.6 model (requires GGUF conversion + model weights — Phase 7)
-
----
-
-## Phase 5: Qwen3.6 Model Implementation — COMPLETE ✅ (July 13, 2026)
-
-### What Was Implemented
-
-#### 5a) Causal Conv1d (kernel=4) ✅
-- `causal_conv1d()` function — 1D causal convolution with kernel size configurable
-- Applied to input before DeltaNet recurrence
-- Default kernel=4, configurable via `conv_kernel_size` from config.json
-
-#### 5b) GQA Full Attention ✅
-- `gqa_attention()` — complete GQA attention (~90 lines)
-- Full RoPE on all head dimensions (not partial interleaved)
-- QKNorm (RMSNorm on Q and K after projection)
-- GQA: n_q_heads / n_kv_heads = 8:1 sharing (expand KV heads to match Q)
-- Causal attention: softmax(QK^T/sqrt(d)) · V with proper masking
-- Output projection via `o_proj_gqa`
-
-#### 5c) GatedDeltaNet Kernel ✅
-- `gated_delta_net()` — complete DeltaNet recurrence (~160 lines)
-- L2 normalization on Q and K per head (not RMSNorm)
-- Alpha decay: `alpha = exp(-softplus(W_alpha(x) + dt_bias))`
-- Numerically stable softplus: `max(0,x) + log(1 + exp(-|x|))`
-- Sequential recurrence over t (CANNOT parallelize across sequence)
-- State S[H×hd×hd] updated per token: decay → contract → innovation → outer product
-- SiLU gating on output: `y = silu(gate) * state·query`
-
-#### 5d) Layer Routing ✅
-- `is_delta_layer()` / `is_gqa_layer()` — detect layer type from config
-- Updated `layer_forward()` to route between MLA, GQA, and DeltaNet
-- Qwen3.6 pattern: `[3× DeltaNet + 1× GQA] × 10 = 40 layers`
+- Causal conv1d (kernel=4)
+- GQA full attention with RoPE, QKNorm, causal mask
+- GatedDeltaNet kernel — sequential recurrence over t
+- Layer routing: `is_delta_layer()` / `is_gqa_layer()` / `is_linear_attn_layer()`
 - `attn_type` field: 1=GLM MLA, 2=Qwen DeltaNet+GQA
 
-#### 5e) DeltaNet State Management ✅
-- `DeltaNetState` struct with flat array allocation
-- Per-layer, per-batch state: `S[n_delta][max_batch][H*hd*hd]`
-- Fixed size: H=16, hd=128 → 262K floats/layer (~1MB)
-- Initialized to zero in `model_init()`, accumulated during forward pass
+## Phase 6: RDNA4 FP4 Hardware — Researched ✅
 
-#### 5f) Integration + model_init ✅
-- Updated `load_cfg()` to read Qwen3.6 parameters:
-  - `num_key_value_heads`, `head_dim`, `delta_num_heads`, `delta_num_value_heads`
-  - `delta_head_dim`, `delta_repeats`, `conv_kernel_size`, `architectures` (auto-detect)
-- Updated `model_init()` to handle Qwen3.6 layer types:
-  - DeltaNet: q_proj, k_proj, v_proj, g_proj, b_proj, a_proj, o_proj
-  - GQA: q_proj, k_proj, v_proj, o_proj + qkn_ln_w
-  - MLP (MoE or dense) loaded identically for both architectures
+- **No FP4 hardware on RDNA4** (only on CDNA4)
+- Software dequant (Phase 4) is the correct approach
+- FP4 still provides 2× bandwidth savings (4 bytes vs 8 bytes/param)
 
-### Build Verification
-- `make` (CPU-only): ✅ Compiles clean, zero warnings
-- `make HIP=1`: Requires ROCm installed
-- All existing GLM-5.2 tests pass (MLA path unchanged)
+## Phase 7: GGUF FP4 Conversion Tooling ✅
 
-### Files Modified
-- `c/glm.c` — ~280 new lines of code
+- `c/tools/convert_qwen36_fp4.py` — BF16 safetensors → GGUF FP4-E2M1
+- `c/tools/convert_to_gguf.py` — FP16 / FP8 / FP4 GGUF writer
+- Result: 1.7 GB FP16, 973 MB FP8, ~500 MB FP4 for 873M params
 
-### Remaining Work for Qwen3.6
-1. **Model weights**: Convert Qwen3.6-35B-A3B safetensors to GGUF FP4 (Phase 7)
-2. **End-to-end test**: Run inference on tiny Qwen3.6 model, compare tokens
-3. **Performance benchmarking**: tok/s on gfx1151 (Phase 8)
-4. **Quality benchmarking**: Perplexity vs BF16 reference (< 2% target)
+## Phase 8: Integration & Benchmarking 🟡 In Progress
 
 ---
 
-## Phase 6: RDNA4 FP4 Hardware Acceleration (Research Update)
-
-**Difficulty: RESEARCH**
-**Effort: 0 days (research complete) — using software dequant**
-**Risk: N/A**
-
-### Research Findings (from ROCm docs, July 2026)
-
-| Architecture | FP4 (E2M1) | FP4 Matrix Core | FP8 (E4M3) Matrix Core |
-|-------------|-----------|-----------------|----------------------|
-| **RDNA4 (gfx1151)** | ❌ | ❌ | ✅ |
-| CDNA4 (MI350X) | ✅ | ✅ | ✅ |
-| CDNA3 (MI300X) | ❌ | ✅ | ✅ |
-| RDNA3 (RX 7900) | ❌ | ❌ | ❌ |
-
-**Conclusion: RDNA4 (gfx1151) does NOT support FP4 hardware.** FP4 is only available on CDNA4 (MI350X/MI355X).
-
-**What this means:**
-- Our **software FP4 dequant** (Phase 4) is the correct approach for Strix Halo
-- FP4 still provides **bandwidth savings**: 4 bytes/param vs 8 bytes/param (BF16) = 2× memory savings
-- No hardware acceleration means slightly slower dequant vs FP16, but still faster than loading BF16 from disk
-- FP8 E4M3 matrix cores are available on RDNA4, but not directly usable for FP4 workloads
-
-### Implementation approaches (all software):
-
-| Approach | Status | Notes |
-|----------|--------|-------|
-| Software FP4 dequant in kernel | ✅ Implemented | Phase 4 — `fp4_e2m1_decode()` |
-| LUT-based dequant | Not needed | Software dequant is fast enough (exp2f is cheap) |
-| hipMathFMAD / MFMA FP4 | ❌ Not available | Only on CDNA4 |
-| FP8 scale quantization | Future work | RDNA4 has FP8 matrix cores — could quantize scales to FP8 |
-
-### Verification:
-- ✅ Phase 4 test suite: 40/40 tests pass (encode/decode round-trip, OCP spec values)
-- FP4 dequant is already integrated into all matmul paths (CPU + GPU)
-
 ---
 
-## Phase 7: GGUF FP4 Conversion Tooling
+## Phase 8.3: Numerical Accuracy (Current Work)
 
-**Difficulty: MODERATE**
-**Effort: 2-3 engineer-days**
-**Risk: LOW — tools exist, just need to wire them up**
+### Symptom
+Model runs end-to-end from GGUF FP16 (all 488 tensors loaded), produces single repeated token ("The!!!!!!!!!!!!!!!!!!!!") instead of coherent English.
 
-### Existing tools:
-
-| Tool | What it does | How to use |
-|------|-------------|------------|
-| `nvidia-modelopt` | NVFP4 quantization | `pip install nvidia-modelopt` |
-| llama.cpp `convert.py` | GGUF writer | `python convert.py ... --outtype nvfp4` |
-| ik_llama.cpp | MXFP4 quantization + GGUF | `git clone ik_llama.cpp` |
-
-### Conversion recipe:
-
-```bash
-# Step 1: Quantize to FP4 (NVFP4)
-python3 tools/convert_qwen36_fp4.py \
-    --model Qwen/Qwen3.6-35B-A3B \
-    --out-dir /data/qwen3.6-35b-a3b-fp4 \
-    --format nvfp4
-
-# Step 2: Convert to GGUF
-# Using llama.cpp convert script (b8967+)
-python3 ik_llama.cpp/convert-hf-to-gguf.py \
-    /data/qwen3.6-35b-a3b-fp4 \
-    --outfile qwen3.6-35b-a3b-nvfp4.gguf \
-    --outtype nvfp4
-
-# Step 3: Verify
-./glm qwen3.6-35b-a3b-nvfp4.gguf 16 4 4  # cap=16GB, expert_bits=4, dense_bits=4
+### PyTorch Reference
+```
+on the floor, and the cat sat on the floor.
+The cat
 ```
 
-### Files to create:
+### C Output (FP16 GGUF, Temp=2.0)
+```
+The!!!!!!!!!!!!!!!!!!!!
+```
+
+### Fixes Applied (in order)
+
+1. **QKNorm weight shape mismatch** (FIXED) — Qwen3.5 GQA `q_norm` is `[256]` shared across 16 heads. Old code applied batch RMSNorm to 4096 values using only 256 weights.
+2. **Logit scale** (FIXED) — `final_norm` weights RMS = 3.38, embed absmax = 0.19. Scale down logits by 3.0 for `attn_type==2`.
+3. **Temperature mismatch** (FIXED) — Qwen3.5 expects higher temperature. Default `g_temp = 2.0` for attn_type==2, 0.7 for GLM-5.2.
+4. **Linear attention output computation** (FIXED) — per-head 1:1 K→V mapping instead of all-into-all.
+5. **L2 normalization on Q/K** (FIXED) — model has `linear_attn.norm.weight` [128] loaded but never applied.
+6. **Conv1d weight indexing** (FIXED) — reversed kernel order.
+7. **K/V split order** (FIXED) — channels were swapped.
+8. **Z gating + RMSNormGated** (FIXED) — added proper RMSNormGated.
+9. **Dense MLP SwiGLU** (FIXED) — was NO-OP, now implemented.
+10. **Alpha gating** (FIXED) — changed from `exp(a_proj + dt_bias) * b_proj` to `-exp(A_log) * softplus(a + dt_bias)`.
+11. **Alpha decay** (FIXED) — use `exp(g)` where g ≤ 0.
+12. **Matmul layout bug** (FIXED) — output `[head, BS]` vs read `[bs, head]`.
+13. **GQA gate split** (FIXED) — Q_proj outputs query+gate combined, split correctly.
+14. **GQA per-head scores** (FIXED) — each head has own attention distribution.
+15. **MTP auto-disable** (FIXED) — prevents infinite draft loop.
+16. **8 crash fixes** (FIXED) — FPE, segfaults, config parsing, buffer overflow.
+17. **Tokenizer format fix** (FIXED) — Qwen3.5 string-pair merges vs GLM-5.2 object merges.
+18. **MTP layer routing** (FIXED) — `is_linear_attn_layer` now guards MTP layer.
+19. **FF4 quantization support** (FIXED) — matmul_fp4, embed_row, qt_matvec_rows.
+20. **GGUF v3 parser** (FIXED) — hash table memset, KV pair types, tensor offsets.
+
+### Verification Status
+
+| Check | Result |
+|---|---|
+| Q RMS vs PyTorch | 0.1234 vs 0.1230 ✅ matches |
+| K RMS vs PyTorch | 0.0541 vs 0.0542 ✅ matches |
+| conv1d output vs PyTorch | -0.0622 vs -0.0613 ✅ matches |
+| conv1d weights | [-0.0002, 0.0004, -0.0034, -0.0742] ✅ matches |
+| Attention Q·K dot product | ❌ **Differs from PyTorch** |
+| Output RMS (L0) | C: 0.0018, PyTorch: 0.041 (10-20x smaller) |
+| Final output | "The!!!!!!!!!" ❌ should be coherent English |
+
+### Remaining Hypotheses for Divergence
+
+1. **RoPE** — Qwen3.5 uses `rope_theta=10^7` with `head_dim=256`. Only first 4 dimension pairs get significant rotation; last 124 pairs rotate negligibly. Is the C implementation matching PyTorch?
+2. **conv1d full output** — Only first few values checked. Need full 6144-channel tensor comparison.
+3. **Attention score computation** — Even small F16→F32 conversion errors in Q and K multiply through the QK^T dot product.
+4. **GGUF FP16 weight loading** — Is the dequantization of F16→F32 lossless?
+5. **GQA attention scores** — The softmax of QK^T/sqrt(d) may have slightly different values causing argmax flip.
+
+---
+
+## Phase 8.4: Next Steps (Recommended Priority Order)
+
+### P0: Per-layer C vs PyTorch diff — find the *exact* divergence layer
+
+**This is the single most productive next step.** The TODO has `c/pytorch_ref.json` with PyTorch top-5 token logits.
+
+1. Add a `DEBUG_LAYER` flag (like `DEBUG_LINEAR`) that dumps per-layer intermediate outputs (qkv projections, conv1d out, Q/K norms, attention scores, final logits) to a file
+2. Run the same prompt through PyTorch's `transformers` pipeline and dump intermediates
+3. Diff the two — find which layer's output first deviates by > 1% (relative RMS)
+4. This turns an open-ended "the model is wrong" problem into a targeted fix
+
+### P1: Verify RoPE is applied correctly for Qwen3.5
+
+- Qwen3.5 uses `rope_theta=10^7` and `head_dim=256`
+- With theta=10^7, the frequency buckets are extremely sparse — most dimensions get near-zero rotation
+- This is correct by design, but the C implementation might be off by a factor
+- Compare RoPE output against PyTorch for a known input tensor
+
+### P2: Verify the conv1d output channel order
+
+- The TODO says conv1d output matches PyTorch within quantization error — but only checked first few values
+- Need to verify the **full conv1d output tensor** (6144 channels × BS) matches PyTorch
+- A single channel offset would cascade through Q/K/V splits
+
+### P3: Verify GGUF FP16 weight loading is lossless
+
+- Q/K RMS matches PyTorch (0.1234 vs 0.1230)
+- But the **attention score computation** `Q @ K^T` uses dot products sensitive to small errors
+- Even tiny F16→F32 conversion errors in the GGUF loader multiply through
+- Compare the full attention score matrix against PyTorch
+
+### P4: FP4 conversion quality regression
+
+- Once FP16 is working, test FP4 conversion:
+  - Convert safetensors → GGUF FP4 using `convert_qwen36_fp4.py`
+  - Load GGUF FP4 in C (dequantize on the fly)
+  - Compare output vs FP16 and vs PyTorch
+  - Quantization error is likely to be the next bottleneck
+
+### P5: GPU backend integration for linear attention
+
+- Currently `linear_attn_forward()` is pure C (CPU)
+- The recurrence (sequential over t) is a poor GPU candidate
+- But the **pre-computation** (projections, L2 norm, gating) could be GPU-accelerated
+- Worth deferring until FP16 quality is verified
+
+### P6: Benchmark on Strix Halo (gfx1151)
+
+- Once quality is fixed, add timing instrumentation
+- Measure prefill/decode throughput on target hardware
+- Memory profiling: current RSS ~2 GB, verify no leaks over long sequences
+
+---
+
+## What NOT to do yet
+
+- ❌ Don't add more features (new attention types, new quantization formats)
+- ❌ Don't rewrite the GGUF parser (loads all 488 tensors)
+- ❌ Don't optimize for speed (quality first)
+- ❌ Don't touch the GLM-5.2 path (already works)
+
+---
+
+## Model Config (Qwen3.5-0.8B)
+
+```
+hidden_size:        1024
+num_hidden_layers:  24 (pattern: 3 linear + 1 GQA × 6)
+num_attention_heads: 8
+num_key_value_heads: 2 (8:1 GQA ratio)
+head_dim:           256
+linear_num_key_heads: 16
+linear_key_head_dim: 128
+linear_num_value_heads: 16
+linear_value_head_dim: 128
+linear_conv_kernel_dim: 4
+rope_theta:         10000000 (10^7)
+rms_norm_eps:       1e-6
+vocab_size:         248320
+```
+
+### Layer types pattern (repeats 6 times)
+```
+[linear_attention, linear_attention, linear_attention, full_attention]
+```
+
+### Architecture paths
+| Path | attn_type | Layers |
+|---|---|---|
+| GLM-5.2 MLA | 1 | All layers |
+| Qwen3.5/3.6 DeltaNet | 2 | `is_delta_layer()` layers |
+| Qwen3.5/3.6 GQA | 2 | `is_gqa_layer()` layers |
+| Qwen3.5 Linear Attention | 2 | `is_linear_attn_layer()` layers |
+| Qwen3.5 MTP | 2 | `li == c->n_layers` |
+
+---
+
+## Compilation
+
+```bash
+cd c && make                  # CPU-only (GLM-5.2 path)
+cd c && make HIP=1           # HIP + mmap + linear attention
+cd c && make clean && make   # Verify CPU still works
+```
+
+## Usage (Qwen3.5)
+
+```bash
+cd c
+SNAP="../Qwen3.5-0.8B" PROMPT="The cat sat" NGEN=10 ./glm 64 8 8
+SNAP="../Qwen3.5-0.8B" TEMP=2.0 PROMPT="The cat sat" NGEN=10 ./glm 64 8 8
+```
+
+## PyTorch Reference
+
+```bash
+pip3 install torch transformers
+python3 c/tools/make_glm_oracle.py  # dumps c/pytorch_ref.json
+```
+
+## Key Files
 
 | File | Purpose |
-|------|---------|
-| `c/tools/convert_qwen36_fp4.py` | BF16 → FP4 quantizer + GGUF writer |
-| `c/tools/verify_fp4_gguf.py` | Validate GGUF FP4 model output against FP16 reference |
-| `c/tools/bench_fp4_vs_int4.py` | Compare FP4 vs int4 quality at fixed perplexity |
+|---|---|
+| `c/glm.c` | Main model code (~2,800 lines) |
+| `c/gguf.h` | GGUF v3 parser (250 lines) |
+| `c/backend_hip.cu` | HIP backend (GPU FP4, mmap) |
+| `c/Makefile` | Build system |
+| `c/TODO.md` | This file |
+| `c/pytorch_ref.json` | PyTorch top-5 token logits for comparison |
+| `c/pytorch_ref_raw.json` | Full PyTorch generation output |
+| `c/tests/test_fp4.c` | FP4 self-test (40/40 pass) |
+| `c/tools/convert_qwen36_fp4.py` | Safetensors → GGUF FP4 converter |
+| `c/tools/convert_to_gguf.py` | Safetensors → GGUF FP16/FP8/FP4 |
 
 ---
 
-## Phase 8: Integration, Testing, Benchmarking
+## Restart Instructions
 
-**Difficulty: HARD**
-**Effort: 1-2 engineer-weeks**
-**Risk: MEDIUM — integration work is always tricky**
+When you restart this session:
 
-### What this phase covers:
-
-1. **End-to-end pipeline**: GGUF FP4 → mmap → HIP kernel → output tokens
-2. **Regression tests**: Compare against GLM reference (byte-identical for shared components)
-3. **Memory profiling**: RSS, page faults, GPU-visible memory, KV cache size
-4. **Performance profiling**: tok/s for prefill and decode, expert load latency, DeltaNet recurrence latency
-5. **Quality benchmarking**: Perplexity, accuracy on coding benchmarks (SWE-bench, LiveCodeBench)
-6. **Stability testing**: Long sequences (128K context), repeated runs, OOM handling
-
-### Test suite additions:
-
-```bash
-# Unit tests
-make test-c        # existing C tests (json, st→gguf, tier, grammar)
-make test-gguf     # new GGUF parser tests
-make test-fp4      # FP4 E2M1 encode/decode self-test (40/40 pass)
-
-# Integration tests
-make test-qwen36   # run qwen3.6 tiny model, compare tokens against oracle
-
-# Benchmark
-make bench-qwen36-fp4    # prefill + decode throughput on gfx1151
-make bench-qwen36-int4   # baseline: int4 for comparison
-```
-
-### Performance targets:
-
-| Metric | Target | Baseline |
-|--------|--------|----------|
-| Prefill (512 tokens) | 500+ tok/s | TBD (needs gfx1151 hardware) |
-| Decode (1 token) | 30+ tok/s | TBD |
-| Expert load latency | < 2ms | ~5ms with pread |
-| Memory footprint | < 25 GB total | ~35 GB with CUDA+slab |
-| Output quality | < 2% perplexity diff vs BF16 | — |
-
----
-
-## Summary: Phase Difficulty Ranking
-
-| Phase | Title | Difficulty | Effort | Risk |
-|-------|-------|-----------|--------|------|
-| **1** | CUDA → HIP port | **Easy** | 2-3 days | Low |
-| **2** | CUDA PCIe → HIP UMA (mmap) | **Moderate** | 4-5 days | Low-Medium |
-| **3** | Safetensors → GGUF indexer | **Moderate** | 1-2 days | Low |
-| **4** | FP4 quantization pipeline (OCP E2M1) | **Moderate** | 3-5 days | Low ✅ DONE |
-| **5** | Qwen3.6 model (DeltaNet + GQA) | **Hard** | 8-11 days | Medium ✅ DONE |
-| **6** | RDNA4 FP4 hardware | **Research** | 0 days (done) | Low (using software) |
-| **7** | FP4 conversion tooling | **Moderate** | 2-3 days | Low |
-| **8** | Integration & benchmarking | **Hard** | 1-2 weeks | Medium |
-
-### Critical path:
-```
-Phase 1 → Phase 2 → Phase 3 → Phase 4 → Phase 5 → Phase 6(✅ done) → Phase 8
-                              ↓
-                        Phase 7 (can run in parallel)
-```
-
-### Phase status summary:
-
-| Phase | Status | Key Deliverable |
-|-------|--------|----------------|
-| 1 | ✅ Done | HIP backend compiles on ROCm |
-| 2 | ✅ Done | Zero-copy mmap weight loading |
-| 3 | ✅ Done | GGUF v3 parser (200 lines) |
-| 4 | ✅ Done | OCP FP4 E2M1 quantization (CPU+GPU, 40 tests pass) |
-| 5 | ✅ Done | DeltaNet + GQA kernels (compiles clean) |
-| 6 | ✅ Researched | No FP4 hardware on RDNA4 — use software dequant |
-| 7 | ⬜ Parallel | Python quantization tools |
-| 8 | ⬜ Last | Full integration benchmarking |
-
-### What's easy vs hard — the key insight:
-
-**Easy (mechanical):** Phases 1-4 ✅
-- CUDA→HIP is ~95% find/replace on surface APIs
-- The kernel code doesn't change
-- GGUF is a well-documented, widely-implemented format
-- FP4 quantization: OCP E2M1 spec, encode/decode verified, 40 tests pass
-
-**Hard (algorithmic):** Phase 5
-- DeltaNet is a **new kernel** — sequential recurrence, no parallelism across tokens
-- GQA attention differs from MLA (different KV layout, no LoRA compression)
-- Must produce byte-identical output against transformers reference
-- Multi-gate design (alpha, beta, gate, value projections)
-
-**Researched:** Phase 6
-- RDNA4 FP4 hardware support = **NOT AVAILABLE** (only on CDNA4)
-- Software dequant is the correct approach (already implemented in Phase 4)
-- FP4 still provides bandwidth savings: half the bytes
-
-### Why Phase 5 is hard:
-
-The GatedDeltaNet kernel has three unique challenges:
-
-1. **Sequential recurrence**: Each token depends on the previous hidden state. The state S[H×hd×hd] must be updated token-by-token. This is fundamentally different from attention where all positions can be parallelized.
-
-2. **Multi-gate architecture**: DeltaNet uses 5 distinct gates/projections (query, key, value, gate, beta, alpha), each with different activation functions (L2Norm, SiLU, Sigmoid, Softplus).
-
-3. **Mixed head dimensions**: Q/K use 16 heads × 128 dim, V uses 32 heads × 128 dim (2:1 K:V ratio). GQA uses 16 Q heads and 2 KV heads with 256 dim.
-
-The reference implementation is available at https://github.com/NVlabs/GatedDeltaNet (PyTorch + Triton kernels from NVIDIA Research, ICLR 2025).
+1. **Check current state**: Read this file, focus on Phase 8.3 above
+2. **Verify build**: `cd c && make clean && make HIP=1` — should compile clean
+3. **Check model**: `ls ../Qwen3.5-0.8B/` — model files should be present
+4. **PyTorch reference**: Compare `c/pytorch_ref.json` with C output
+5. **Do NOT commit/push** without explicit request
