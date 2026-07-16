@@ -48,3 +48,5 @@ stats*.txt
 /sweep.py
 # CocoIndex Code (ccc)
 /.cocoindex_code/
+**/*.html
+Qwen3.5-0.8B
