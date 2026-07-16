@@ -59,7 +59,7 @@ endif
 
 # HIP=1 adds an opt-in backend for resident tensors. The default build remains
 # pure C and keeps the original zero-dependency runtime.
-HIP      ?= 0
+HIP      ?= 1
 HIP_HOME ?= /opt/rocm
 HIPCC    ?= $(HIP_HOME)/bin/hipcc
 HIPFLAGS ?= -O3 -std=c++17 -Wall -Wextra

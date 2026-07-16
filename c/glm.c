@@ -1444,7 +1444,12 @@ static void linear_attn_forward(Model *m, Layer *l, int layer,
     }
     if(getenv("DEBUG_LINEAR")){
         float k_rms=0; for(int bs=0;bs<BS;bs++) for(int h=0;h<nq;h++) for(int d=0;d<kd;d++) k_rms += k_all[(int64_t)bs*nq*kd+(int64_t)h*kd+d]*k_all[(int64_t)bs*nq*kd+(int64_t)h*kd+d];
-        fprintf(stderr,"[LIN] L%d: pre_l2_k_rms=%.6f K_raw[0]=%.6f K_raw[1]=%.6f\n",layer,sqrtf(k_rms/(nq*kd*BS)),k_all[0],k_all[1]);
+        float k0 = 0, k1 = 0;
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
+        k0 = k_all[0]; k1 = k_all[1];
+#pragma GCC diagnostic pop
+        fprintf(stderr,"[LIN] L%d: pre_l2_k_rms=%.6f K_raw[0]=%.6f K_raw[1]=%.6f\n",layer,sqrtf(k_rms/(nq*kd*BS)),k0,k1);
     }
 
     /* 4) Z, A, B projections (from separate weight tensors)
@@ -2295,7 +2300,7 @@ static void expert_load(Model *m, int layer, int eid, ESlot *s){
         s->eid=eid; return;
     }
     gguf_tensor *tw[3], *tq[3];
-    char qsuf[3][400];
+    char qsuf[3][1024];
     for(int k=0;k<3;k++){
         tw[k]=st_find(&m->S,nm[k]);
         snprintf(qsuf[k],sizeof(qsuf[k]),"%s.scales",nm[k]);

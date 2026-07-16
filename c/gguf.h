@@ -203,7 +203,7 @@ static int gguf_init(gguf_ctx *ctx, const char *path) {
 
     /* GGUF v3: read tensor data offsets from separate section (contiguous uint64, no padding) */
     fprintf(stderr, "[GGUF] reading tensor data offsets at pos=%lld\n", (long long)pos);
-    for (uint64_t i = 0; i < tensor_count && i < ctx->n; i++) {
+    for (uint64_t i = 0; i < tensor_count && i < (uint64_t)ctx->n; i++) {
         uint64_t off;
         if (gguf_pread_u64(ctx->fd, pos, &off) < 0) { fprintf(stderr,"[GGUF] failed to read offset[%lu] at pos=%lld\n", i, (long long)pos); goto error; }
         ctx->t[i].off = (int64_t)off;
