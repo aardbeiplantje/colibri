@@ -60,60 +60,47 @@ static inline int64_t _gguf_nbytes(gguf_ctx *ctx, const char *name){
 }
 
 /* ── DEBUG_LAYER: per-layer intermediate dump for C vs PyTorch comparison ── */
-static FILE *debug_layer_fp = NULL;
+static int debug_layer_bufpos = 0;
+static unsigned debug_layer_hash = 0;
+static char debug_layer_buf[1024*1024] = {0};
 static void debug_layer_init(const char *prompt){
     if(!getenv("DEBUG_LAYER")) return;
     char fname[512];
-    unsigned hash = 0;
-    for(const char *p = prompt; *p; p++) hash = hash * 31 + *p;
-    snprintf(fname, sizeof(fname), "c/debug_layer_%08x.json", hash);
-    debug_layer_fp = fopen(fname, "w");
-    if(debug_layer_fp){
-        fprintf(debug_layer_fp, "{\n  \"prompt\": \"%s\",\n  \"n_layers\": %d,\n  \"layers\": [\n", prompt, 24);
-    } else {
-        fprintf(stderr, "[DEBUG_LAYER] failed to open %s\n", fname);
-    }
+    debug_layer_hash = 0;
+    for(const char *p = prompt; *p; p++) debug_layer_hash = debug_layer_hash * 31 + *p;
+    snprintf(fname, sizeof(fname), "debug_layer_%08x.json", debug_layer_hash);
+    fprintf(stderr, "[DEBUG_LAYER] init hash=0x%08x file=%s\n", debug_layer_hash, fname);
+    debug_layer_bufpos = 0;
+    debug_layer_bufpos += snprintf(debug_layer_buf + debug_layer_bufpos, sizeof(debug_layer_buf) - debug_layer_bufpos, "{\n  \"prompt\": \"%s\",\n  \"n_layers\": 25,\n  \"layers\": {\n", prompt);
 }
 static void debug_layer_dump(int li, const char *label, const float *data, int n, int S){
-    if(!debug_layer_fp) return;
-    /* Dump RMS and first 8 values per sequence position */
+    if(!debug_layer_bufpos) return;
     float rms = 0, absmx = 0;
     for(int i=0; i<n; i++){ float v = data[i]*data[i]; rms += v; if(v>absmx) absmx = v; }
     rms = sqrtf(rms / n); absmx = sqrtf(absmx);
-    if(S > 1){
-        /* Multi-token: dump per-position samples */
-        fprintf(debug_layer_fp, "    \"%s\": {\n", label);
-        fprintf(debug_layer_fp, "      \"rms\": %.8f, \"absmx\": %.8f,\n", rms, absmx);
-        fprintf(debug_layer_fp, "      \"S\": %d,\n", S);
-        for(int s = 0; s < S && s < 8; s++){
-            fprintf(debug_layer_fp, "      \"pos%d\": [", s);
-            for(int i = 0; i < n && i < 16; i++){
-                if(i) fprintf(debug_layer_fp, ", ");
-                fprintf(debug_layer_fp, "% .6f", data[(int64_t)s*n + i]);
-            }
-            fprintf(debug_layer_fp, "]%s\n", s < S-1 ? "," : "");
-        }
-        fprintf(debug_layer_fp, "    },\n");
-    } else {
-        fprintf(debug_layer_fp, "    \"%s\": {\n", label);
-        fprintf(debug_layer_fp, "      \"rms\": %.8f, \"absmx\": %.8f,\n", rms, absmx);
-        fprintf(debug_layer_fp, "      \"first16\": [");
-        for(int i = 0; i < n && i < 16; i++){
-            if(i) fprintf(debug_layer_fp, ", ");
-            fprintf(debug_layer_fp, "% .6f", data[i]);
-        }
-        fprintf(debug_layer_fp, "]\n    },\n");
+    char key[64];
+    snprintf(key, sizeof(key), "l%d_%s", li, label);
+    /* Last measurement: layer_out of last layer (23), since mtp_absorb not called with DRAFT=0 */
+    int is_last = (li == 23 && strcmp(label, "layer_out") == 0) ? 1 : 0;
+    debug_layer_bufpos += snprintf(debug_layer_buf + debug_layer_bufpos, sizeof(debug_layer_buf) - debug_layer_bufpos,
+        "      \"%s\": {\n        \"rms\": %.8f,\n        \"first16\": [", key, rms);
+    for(int i = 0; i < 16 && i < n; i++){
+        if(i) debug_layer_bufpos += snprintf(debug_layer_buf + debug_layer_bufpos, sizeof(debug_layer_buf) - debug_layer_bufpos, ", ");
+        debug_layer_bufpos += snprintf(debug_layer_buf + debug_layer_bufpos, sizeof(debug_layer_buf) - debug_layer_bufpos, "% .6f", data[i]);
     }
+    debug_layer_bufpos += snprintf(debug_layer_buf + debug_layer_bufpos, sizeof(debug_layer_buf) - debug_layer_bufpos, "]\n      }%s\n", is_last ? "" : ",");
 }
 static void debug_layer_done(int li){
-    if(!debug_layer_fp) return;
-    if(li < 23) fprintf(debug_layer_fp, "    },\n");
-    else fprintf(debug_layer_fp, "    }\n");
-    if(li == 23){
-        fprintf(debug_layer_fp, "  ]\n}\n");
-        fclose(debug_layer_fp);
-        debug_layer_fp = NULL;
+    if(!debug_layer_bufpos) return;
+    debug_layer_bufpos += snprintf(debug_layer_buf + debug_layer_bufpos, sizeof(debug_layer_buf) - debug_layer_bufpos, "    }\n  }\n");
+    char fname[512];
+    snprintf(fname, sizeof(fname), "debug_layer_%08x.json", debug_layer_hash);
+    FILE *fp = fopen(fname, "w");
+    if(fp){
+        fprintf(fp, "%s", debug_layer_buf);
+        fclose(fp);
     }
+    debug_layer_bufpos = 0;
 }
 
 #include "tok.h"
