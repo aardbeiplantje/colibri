@@ -58,6 +58,64 @@ static inline int64_t _gguf_nbytes(gguf_ctx *ctx, const char *name){
     if(t->dtype == GGML_TYPE_NVFP8) return n;
     return n * 2;  /* default to F16 */
 }
+
+/* ── DEBUG_LAYER: per-layer intermediate dump for C vs PyTorch comparison ── */
+static FILE *debug_layer_fp = NULL;
+static void debug_layer_init(const char *prompt){
+    if(!getenv("DEBUG_LAYER")) return;
+    char fname[512];
+    unsigned hash = 0;
+    for(const char *p = prompt; *p; p++) hash = hash * 31 + *p;
+    snprintf(fname, sizeof(fname), "c/debug_layer_%08x.json", hash);
+    debug_layer_fp = fopen(fname, "w");
+    if(debug_layer_fp){
+        fprintf(debug_layer_fp, "{\n  \"prompt\": \"%s\",\n  \"n_layers\": %d,\n  \"layers\": [\n", prompt, 24);
+    } else {
+        fprintf(stderr, "[DEBUG_LAYER] failed to open %s\n", fname);
+    }
+}
+static void debug_layer_dump(int li, const char *label, const float *data, int n, int S){
+    if(!debug_layer_fp) return;
+    /* Dump RMS and first 8 values per sequence position */
+    float rms = 0, absmx = 0;
+    for(int i=0; i<n; i++){ float v = data[i]*data[i]; rms += v; if(v>absmx) absmx = v; }
+    rms = sqrtf(rms / n); absmx = sqrtf(absmx);
+    if(S > 1){
+        /* Multi-token: dump per-position samples */
+        fprintf(debug_layer_fp, "    \"%s\": {\n", label);
+        fprintf(debug_layer_fp, "      \"rms\": %.8f, \"absmx\": %.8f,\n", rms, absmx);
+        fprintf(debug_layer_fp, "      \"S\": %d,\n", S);
+        for(int s = 0; s < S && s < 8; s++){
+            fprintf(debug_layer_fp, "      \"pos%d\": [", s);
+            for(int i = 0; i < n && i < 16; i++){
+                if(i) fprintf(debug_layer_fp, ", ");
+                fprintf(debug_layer_fp, "% .6f", data[(int64_t)s*n + i]);
+            }
+            fprintf(debug_layer_fp, "]%s\n", s < S-1 ? "," : "");
+        }
+        fprintf(debug_layer_fp, "    },\n");
+    } else {
+        fprintf(debug_layer_fp, "    \"%s\": {\n", label);
+        fprintf(debug_layer_fp, "      \"rms\": %.8f, \"absmx\": %.8f,\n", rms, absmx);
+        fprintf(debug_layer_fp, "      \"first16\": [");
+        for(int i = 0; i < n && i < 16; i++){
+            if(i) fprintf(debug_layer_fp, ", ");
+            fprintf(debug_layer_fp, "% .6f", data[i]);
+        }
+        fprintf(debug_layer_fp, "]\n    },\n");
+    }
+}
+static void debug_layer_done(int li){
+    if(!debug_layer_fp) return;
+    if(li < 23) fprintf(debug_layer_fp, "    },\n");
+    else fprintf(debug_layer_fp, "    }\n");
+    if(li == 23){
+        fprintf(debug_layer_fp, "  ]\n}\n");
+        fclose(debug_layer_fp);
+        debug_layer_fp = NULL;
+    }
+}
+
 #include "tok.h"
 #include "tier.h"
 #include "grammar.h"                              /* metodo F: draft grammaticali (#48) */
@@ -2973,37 +3031,22 @@ static void layer_forward(Model *m, Layer *l, int li, float *x, int S, int pos_b
         free(x_orig);
 
         if(getenv("DEBUG_LAYER")){
-            /* Post-attention RMS (before residual add) */
-            float rms_attn=0;
-            for(int j=0;j<D;j++) rms_attn+=tmp[j]*tmp[j];
-            rms_attn=sqrtf(rms_attn/D);
-            /* Post-attention + residual RMS */
-            float rms_x=0;
-            for(int j=0;j<D;j++) rms_x+=x[j]*x[j];
-            rms_x=sqrtf(rms_x/D);
-            fprintf(stderr,"[LAY%d] attn_out_rms=%.4f post_resid_rms=%.4f x[0]=%.4f\n",
-                li, rms_attn, rms_x, x[0]);
+            debug_layer_dump(li, "attn_out", tmp, D, S);
+            debug_layer_dump(li, "post_resid", x, D, S);
         }
 
         /* Post-attention normalization (post_attention_layernorm) — Qwen3.5 offset weights */
         for(int s=0;s<S;s++) rmsnorm_qw35(nrm+(int64_t)s*D, x+(int64_t)s*D, l->post_ln, D, c->eps);
 
         if(getenv("DEBUG_LAYER")){
-            float rms_postln=0;
-            for(int j=0;j<D;j++) rms_postln+=nrm[j]*nrm[j];
-            rms_postln=sqrtf(rms_postln/D);
-            fprintf(stderr,"[LAY%d] post_ln_rms=%.4f\n", li, rms_postln);
+            debug_layer_dump(li, "post_ln", nrm, D, S);
         }
 
         /* MLP: MoE routing or dense */
         fprintf(stderr,"[LAYFWD] layer %d: mlp_sparse=%d\n", li, l->sparse);
         if(l->sparse) moe(m,l,li,nrm,S,tmp); else dense_mlp(l,nrm,S,D,c->dense_inter,tmp);
         if(getenv("DEBUG_LAYER")){
-            float rms_mlp=0, absmx_mlp=0;
-            for(int j=0;j<D;j++){ float v=tmp[j]*tmp[j]; rms_mlp+=v; if(v>absmx_mlp)absmx_mlp=v; }
-            rms_mlp=sqrtf(rms_mlp/D);
-            fprintf(stderr,"[LAY%d] mlp_out_rms=%.4f mlp_absmx=%.4f mlp[0]=%.4f\n",
-                li, rms_mlp, sqrtf(absmx_mlp), tmp[0]);
+            debug_layer_dump(li, "mlp_out", tmp, D, S);
         }
         for(int64_t j=0;j<(int64_t)S*D;j++) x[j]+=tmp[j];
     }
@@ -3019,12 +3062,13 @@ static void layers_forward(Model *m, float *x, int S, int pos_base){
         layer_forward(m,&m->L[i],i,x,S,pos_base,nrm,tmp);
         if(getenv("DEBUG_LAYER")){
             float rms=0, absmx=0;
-            for(int j=0;j<D;j++){
-                float v=x[j]*x[j]; rms+=v; if(v>absmx)absmx=v;
-            }
+            for(int j=0;j<D;j++){ float v=x[j]*x[j]; rms+=v; if(v>absmx)absmx=v; }
             rms=sqrtf(rms/D); absmx=sqrtf(absmx);
-            fprintf(stderr,"[LAYER%d] rms=%.4f absmx=%.4f x[0]=%.4f x[1]=%.4f x[2]=%.4f x[3]=%.4f x[4]=%.4f\n",
-                i, rms, absmx, x[0], x[1], x[2], x[3], x[4]);
+            /* Store layer output before next layer processes it */
+            float *layer_out = falloc((int64_t)S*D);
+            memcpy(layer_out, x, (int64_t)S*D * sizeof(float));
+            debug_layer_dump(i, "layer_out", layer_out, D, S);
+            free(layer_out);
         }
     }
     free(nrm); free(tmp);
@@ -3527,6 +3571,8 @@ static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
     } else {
         snprintf(tkp,sizeof(tkp),"%s/tokenizer.json",snap);
     }
+    /* DEBUG_LAYER: init per-layer JSON dump */
+    if(getenv("DEBUG_LAYER")) debug_layer_init(prompt);
     Tok T; tok_load(&T,tkp);
     int eos=tok_id_of(&T,"<|endoftext|>");
     stops_arm(&m->c, eos);
@@ -3573,6 +3619,8 @@ static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
             la_tot[i]?100.0*la_hit[i]/la_tot[i]:0.0, (long long)la_hit[i], (long long)la_tot[i]);
     }
     free(pids); free(all);
+    /* DEBUG_LAYER: finish per-layer JSON dump */
+    if(getenv("DEBUG_LAYER")) debug_layer_done(c->n_layers-1);
     usage_save(m);
 }
 
