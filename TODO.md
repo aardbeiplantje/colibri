@@ -117,6 +117,47 @@ The conv1d output RMS is close (C=0.096, PyTorch=0.11) but not exact. The first 
 
 ## PLAN: Fix Conv1d Output Divergence (Next Session)
 
+### P0: Element-by-Element conv1d Comparison ✅ FIXED
+1. ✅ Dump PyTorch conv1d input/output for all 3 timesteps and first 32 channels
+2. ✅ Dump C conv1d input/output for same positions  
+3. ✅ Found qkv_t transpose bug: was assigning same value to all timesteps
+4. ✅ Fixed: qkv_t[bs, c_dim, 0] = qkv_all[bs, c_dim]
+
+### P1: Check conv1d Weight Layout ✅ VERIFIED
+- ✅ C's wc[k] at index c_dim * ck + k matches PyTorch's weight[c_dim, 0, k]
+- ✅ w[0]=-0.000161, [1]=0.000404, [2]=-0.003387, [3]=-0.074219 matches
+
+### P2: Check conv1d Computation ✅ FIXED
+- ✅ qkv_t index: ti*conv_dim*S + c_dim*S (was b*S*conv_dim + ti*conv_dim + c_dim)
+- ✅ conv1d output now matches PyTorch element-by-element
+- ✅ v_raw RMS now matches PyTorch (0.1335)
+
+### P3: Check Silu Application ✅ VERIFIED
+- ✅ PyTorch: F.silu(conv_out)[:, :, :S]
+- ✅ C: applies silu after transpose back to [BS, conv_dim]
+- Both produce same result
+
+### P4: Check Recurrence
+- ✅ Manual PyTorch recurrence matches C output (out_proj RMS=0.069)
+- ❌ PyTorch fla's chunk_gated_delta_rule produces different results (RMS=0.038)
+- **ROOT CAUSE**: fla library implements the gated delta rule differently
+
+### P5: Investigate fla implementation differences
+- The chunk_gated_delta_rule from fla may use different numerical precision
+- May apply L2 normalization internally vs externally
+- May have different chunking strategy affecting accumulation
+- May use fused operations that produce different rounding
+
+### P6: Fix z-gating and Output Projection
+- The z-gating matches PyTorch manual computation
+- out_proj weights match
+- The remaining difference is in the recurrence itself
+
+### P7: Compare fla implementation details
+- Check if fla's use_qk_l2norm_in_kernel=True changes normalization
+- Check if fla uses different softplus or sigmoid implementations
+- Check if fla's chunking causes different accumulation order
+
 ### P0: Element-by-Element conv1d Comparison
 1. Dump PyTorch conv1d input/output for all 3 timesteps and first 32 channels
 2. Dump C conv1d input/output for same positions
