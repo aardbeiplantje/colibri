@@ -1440,8 +1440,8 @@ static void linear_attn_forward(Model *m, Layer *l, int layer,
         }
         if(getenv("DEBUG_LINEAR")){
             float rms_c=0; for(int i=0;i<BS*conv_dim*S;i++) rms_c+=qkv_c[i]*qkv_c[i];
-            fprintf(stderr,"[LIN] L%d: conv1d_out_rms=%.6f conv1d_out[0]=%.6f conv1d_out[1]=%.6f\n",
-                layer, sqrtf(rms_c/(BS*conv_dim*S)), qkv_c[0], qkv_c[1]);
+            fprintf(stderr,"[LIN] L%d: conv1d_out_rms=%.6f conv1d_out[0]=%.6f conv1d_out[1]=%.6f conv1d_out[2]=%.6f conv1d_out[3]=%.6f\n",
+                layer, sqrtf(rms_c/(BS*conv_dim*S)), qkv_c[0], qkv_c[1], qkv_c[2], qkv_c[3]);
         }
         /* Transpose back: [BS, conv_dim, S] -> [BS, conv_dim] */
         for(int b = 0; b < B; b++){
@@ -1642,6 +1642,14 @@ static void linear_attn_forward(Model *m, Layer *l, int layer,
     /* 7) Z gating + RMSNorm: match Qwen3_5RMSNormGated(core_attn, z)
      * = RMSNorm(core_attn) * weight * silu(z)
      * z_all uses [BS, nv*vd] layout from matmul. y_all uses [BS, nv*vd] layout. */
+    if(getenv("DEBUG_LINEAR") && layer==0 && B==1){
+        fprintf(stderr,"[LIN] L%d: z_all[0]=%.6f z_all[1]=%.6f z_all[2]=%.6f z_all[3]=%.6f\n",
+            layer, z_all[0], z_all[1], z_all[2], z_all[3]);
+        float rms_z=0; for(int i=0;i<nv*vd;i++) rms_z+=z_all[i]*z_all[i];
+        fprintf(stderr,"[LIN] L%d: silu(z)_first4=[% .6f, % .6f, % .6f, % .6f]\n",
+            layer,
+            siluf(z_all[0]), siluf(z_all[1]), siluf(z_all[2]), siluf(z_all[3]));
+    }
     for(int bs = 0; bs < BS; bs++){
         for(int h = 0; h < nv; h++){
             float *yo = y_all + (int64_t)bs*nv*vd + (int64_t)h*vd;
@@ -1659,6 +1667,16 @@ static void linear_attn_forward(Model *m, Layer *l, int layer,
 
     /* 8) Output projection: y[BS, nv*vd] -> out[BS, D]
      * y_all is [BS, nv*vd], o_proj_delta is [D, nv*vd], output is [BS, D]. */
+    if(getenv("DEBUG_LINEAR") && layer==0){
+        fprintf(stderr,"[LIN] L%d: o_proj weight[0]=%.6f weight[1]=%.6f weight[2]=%.6f weight[2048]=%.6f\n",
+            layer, l->o_proj_delta.qf[0], l->o_proj_delta.qf[1], l->o_proj_delta.qf[2], l->o_proj_delta.qf[2048]);
+        fprintf(stderr,"[LIN] L%d: y_all first16=[", layer);
+        for(int j=0; j<16 && j<nv*vd; j++) {
+            if(j) fprintf(stderr, ", ");
+            fprintf(stderr, "% .6f", y_all[j]);
+        }
+        fprintf(stderr, "]\n");
+    }
     if(getenv("DEBUG_LINEAR")){
         float rms_y=0; for(int bs=0;bs<BS;bs++) for(int h=0;h<nv;h++) for(int d=0;d<vd;d++) rms_y += y_all[(int64_t)bs*nv*vd+(int64_t)h*vd+d]*y_all[(int64_t)bs*nv*vd+(int64_t)h*vd+d];
         fprintf(stderr,"[LIN] L%d: pre_out_y_rms=%.4f y[0]=%.6f y[1]=%.6f y[2]=%.6f\n",
@@ -1667,7 +1685,8 @@ static void linear_attn_forward(Model *m, Layer *l, int layer,
     matmul_qt(out_proj, y_all, &l->o_proj_delta, BS);
     if(getenv("DEBUG_LINEAR")){
         float rms_out=0; for(int bs=0;bs<BS;bs++) for(int i=0;i<D;i++) rms_out+=out_proj[(int64_t)bs*D+i]*out_proj[(int64_t)bs*D+i];
-        fprintf(stderr,"[LIN] L%d: post_out_rms=%.4f\n",layer,sqrtf(rms_out/(BS*D)));
+        fprintf(stderr,"[LIN] L%d: post_out_rms=%.4f first4=[% .6f, % .6f, % .6f, % .6f]\n",
+            layer,sqrtf(rms_out/(BS*D)),out_proj[0],out_proj[1],out_proj[2],out_proj[3]);
     }
     memcpy(out, out_proj, (int64_t)BS * D * sizeof(float));
     if(getenv("DEBUG_LINEAR")){

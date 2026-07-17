@@ -103,17 +103,69 @@ The cat sat fung unit SOVE...
 ### Root Cause
 Conv1d kernel indexing was wrong: used `ti=t-(ck-1-k)` but should use `ti=t-k` because GGUF flat array layout differs from PyTorch in-memory layout. Fixed in commit f56dc25.
 
-### Remaining Issue
-Attention output values are scaled correctly (RMS=0.029 vs PyTorch 0.038) but individual values differ, causing wrong token selection. Possible causes:
-- Transpose/sign error in attention recurrence
-- z-gating or output projection mismatch
-- QKV projection weight loading order
+### Current Status (as of 2026-07-17)
 
-### Next Debug Steps
-1. Compare attention output values C vs PyTorch at per-element level
-2. Check if difference is consistent across all layers
-3. Verify attention recurrence: S = alpha*S + k*beta*(v - k^T*S), y = S^T@q
-4. Check z-gating: z = silu(in_proj_z(x_ln)), output = RMSNorm(y) * z
+**Verified correct:**
+1. ✅ Conv1d kernel indexing — ti = t - k (commit f56dc25)
+2. ✅ K normalization RMS — matches PyTorch (0.022)
+3. ✅ A_log / dt_bias values — match PyTorch exactly
+4. ✅ Gating values (beta, silu(gate)) — match PyTorch
+5. ✅ Output projection RMS — matches PyTorch (0.037)
+
+**Remaining issue:**
+- Per-element attention values differ even though RMS matches
+- Model generates tokens from many languages (Russian, Korean, Chinese) instead of English
+- The softmax distribution is shifted → wrong argmax
+
+### Plan: Fix Per-Element Divergence
+
+**Step 1: Full PyTorch reference dump (P0)**
+- Run PyTorch model to dump ALL intermediate tensors for each layer
+- Include: in_proj_qkv, conv1d_out, Q, K, V, z, beta, alpha/g, decay, state, y_all, out_proj
+- Compare element-by-element with C output
+
+**Step 2: Identify exact divergence point**
+- Check QKV projection: `in_proj_qkv` shape [6144, 1024] — is the matmul layout correct?
+- Check z projection: `in_proj_z` shape [2048, 1024] — verify loading and matmul
+- Check conv1d output: compare exact values, not just RMS
+- Check Q/K L2 normalization: verify no spurious division by head_dim
+- Check recurrence: verify S[h, i, j] = decay*S[h,i,j] + kv[i] * (v[j] - kv_mem[j]) * beta[h]
+- Check output: y[bs, h, d] = sum_i q[bs, h, i] * S[h, i, d] — verify einsum order
+- Check z-gating: RMSNorm(y) * silu(z) — verify weight application
+- Check output proj: out = y @ W_out.T — verify weight shape and matmul
+
+**Step 3: Compare RoPE application**
+- Qwen3.5 applies RoPE to Q/K — check if it's applied before or after the linear attention
+- In gated_delta_net: RoPE is applied to Q/K in the GQA path, not the linear path
+- In linear_attn_forward: No explicit RoPE — check if input already has RoPE applied
+
+**Step 4: Compare attention output projection**
+- The final layer output goes through lm_head
+- Check if lm_head weights are loaded correctly
+- Check temperature scaling: Qwen3.5 needs different temperature than GLM
+
+**Step 5: Fix the identified issue and retest**
+
+### Architecture Differences: Qwen3.5 vs GLM
+
+| Feature | GLM | Qwen3.5 |
+|---------|-----|---------|
+| Attention | Standard causal (O(n²)) | Linear attention (O(n)) |
+| State | KV cache | Recurrent state S[h, kd, vd] |
+| Recurrence | None | S = decay * S + K * beta * (V - K^T*S) |
+| Output | softmax(Q@K^T) @ V | Q^T @ S |
+| Conv1d | None | Causal conv on QKV input |
+| Gating | None | RMSNormGated: RMSNorm(y) * weight * silu(z) |
+| Q/K Norm | Per-head RMSNorm | Per-head L2 normalize |
+| Decay rate | N/A | g = -exp(A_log) * softplus(a + dt_bias) |
+| Architecture | Standard transformer | [linear, linear, linear, full] × 6 |
+
+### Fixes Applied (in order)
+1. Conv1d weight layout — load as flat f32, apply as grouped conv
+2. QKNorm per-head — use head_dim weights, not batch
+3. Logit scale — divide by 3.0 for Qwen3.5/3.6
+4. Temperature — set to 2.0 for Qwen3.5
+5. Conv1d kernel indexing — ti = t - k (commit f56dc25)
 
 ### Fixes Applied (in order)
 
