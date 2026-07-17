@@ -1397,13 +1397,16 @@ static void linear_attn_forward(Model *m, Layer *l, int layer,
      *
      * qkv_all from matmul is [BS, conv_dim]. Transpose to [BS, conv_dim, S] for conv1d.
      * After conv1d, transpose back to [BS, conv_dim]. */
-    /* Transpose: [BS, conv_dim] -> [BS, conv_dim, S] */
+    /* Transpose: [BS, conv_dim] -> [BS, conv_dim, S]
+     * qkv_all layout: [bs, conv_dim] where bs indexes timestep (0..S-1)
+     * qkv_t layout: [bs, conv_dim, t] where bs=batch, t=timestep */
     float *qkv_t = falloc((int64_t)BS*conv_dim*S);
     for(int b = 0; b < B; b++){
         for(int t = 0; t < S; t++){
-            int bs = b*S + t;
+            int bs = b*S + t;  /* bs indexes the input timestep */
             for(int c_dim = 0; c_dim < conv_dim; c_dim++){
-                qkv_t[(int64_t)bs*conv_dim*S + (int64_t)c_dim*S + t] =
+                /* qkv_t[bs, c_dim, 0] = qkv_all[bs, c_dim] — all timesteps get same value */
+                qkv_t[(int64_t)bs*conv_dim*S + (int64_t)c_dim*S] =
                     qkv_all[(int64_t)bs * conv_dim + c_dim];
             }
         }
@@ -1438,6 +1441,7 @@ static void linear_attn_forward(Model *m, Layer *l, int layer,
                         if(ti < 0 || ti >= S) continue;
                         /* qkv_t layout: [BS, conv_dim, S], index = bs*conv_dim*S + c_dim*S + t */
                         int qkv_idx = (int64_t)ti * conv_dim * S + (int64_t)c_dim * S;
+                        /* qkv_t[bs, c_dim, 0] = qkv_all[bs, c_dim] — value at timestep bs */
                         acc += qkv_t[qkv_idx] * wc[k];
                     }
                     out_c[c_dim*S_full + t] = acc;
@@ -1446,8 +1450,18 @@ static void linear_attn_forward(Model *m, Layer *l, int layer,
         }
         if(getenv("DEBUG_LINEAR")){
             float rms_c=0; for(int i=0;i<BS*conv_dim*S_full;i++) rms_c+=qkv_c[i]*qkv_c[i];
-            fprintf(stderr,"[LIN] L%d: conv1d_out_rms=%.6f (full=%d) conv1d_out[0]=%.6f conv1d_out[1]=%.6f conv1d_out[2]=%.6f conv1d_out[3]=%.6f conv1d_out[4]=%.6f conv1d_out[5]=%.6f\n",
-                layer, sqrtf(rms_c/(BS*conv_dim*S_full)), S_full, qkv_c[0], qkv_c[1], qkv_c[2], qkv_c[3], qkv_c[4], qkv_c[5]);
+            fprintf(stderr,"[LIN] L%d: conv1d_out_rms=%.6f (full=%d)\n",
+                layer, sqrtf(rms_c/(BS*conv_dim*S_full)), S_full);
+            /* Compare first 8 channels, first 3 timesteps */
+            fprintf(stderr,"[LIN] L%d: conv1d_out[0:23]=", layer);
+            for(int c=0;c<8;c++) for(int t=0;t<S;t++){
+                if(c*3+t) fprintf(stderr, " ");
+                fprintf(stderr, "%.6f", qkv_c[(int64_t)c*S_full + t]);
+            }
+            fprintf(stderr,"\n");
+            /* Compare conv1d weight[0:4] */
+            fprintf(stderr,"[LIN] L%d: conv1d_w[0:3]=%.6f %.6f %.6f %.6f\n",
+                layer, l->conv1d_w[0], l->conv1d_w[1], l->conv1d_w[2], l->conv1d_w[3]);
         }
         /* Transpose back: [BS, conv_dim, S_full] -> [BS, conv_dim], apply silu */
         for(int b = 0; b < B; b++){

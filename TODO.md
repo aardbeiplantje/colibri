@@ -79,7 +79,7 @@
 ## Phase 8.3: Numerical Accuracy (Current Work)
 
 ### Symptom
-Model runs end-to-end from GGUF FP16 (all 488 tensors loaded). Previously produced single repeated token ("The!!!!!!!!!!!!!!!!!!!!"). After conv1d fix (commit f56dc25), now produces "The cat sat fung unit SOVE..." — coherent-ish but wrong tokens.
+Model runs end-to-end from GGUF FP16 (all 488 tensors loaded). Previously produced "The!!!!!!!!!!!!!!!!!!!!", then "The cat sat fung unit SOVE...", now "The cat sat andre ... HTTP Cair Calabria..." — improving but wrong tokens.
 
 ### PyTorch Reference
 ```
@@ -87,64 +87,75 @@ on the floor, and the cat sat on the floor.
 The cat
 ```
 
-### C Output (FP16 GGUF, Temp=2.0, after conv1d fix)
+### C Output (latest)
 ```
-The cat sat fung unit SOVE...
+The cat sat andre ... HTTP Cair Calabria 过年 表述 destinado
 ```
 
-### Key Metrics (Layer 0)
+### Key Metrics (Layer 0, latest)
 | Metric | C | PyTorch | Status |
 |--------|---|---------|--------|
-| QKV RMS | ~same | ~same | ✅ |
-| K norm RMS | 0.022 | 0.022 | ✅ |
-| Attention RMS | 0.029 | 0.038 | ⚠️ close |
-| Attention first16 | different | [-0.648, 0.063, ...] | ⚠️ scale OK, values off |
+| QKV RMS | 1.2901 | 1.2901 | ✅ exact |
+| K norm RMS | 0.0883 | 0.0884 | ✅ |
+| conv1d_out RMS | 0.0964 | 0.1100 | ⚠️ close |
+| post_out RMS | 0.0589 | 0.0377 | ⚠️ different |
+| conv1d_out[0] | -0.0612 | -0.0612 | ✅ exact match! |
+| v_raw RMS | 0.0751 | 0.1335 | ❌ off by 2x |
 
-### Root Cause
-Conv1d kernel indexing was wrong: used `ti=t-(ck-1-k)` but should use `ti=t-k` because GGUF flat array layout differs from PyTorch in-memory layout. Fixed in commit f56dc25.
-
-### Current Status (as of 2026-07-17)
-
-**Verified correct:**
+### Recent Fixes
 1. ✅ Conv1d kernel indexing — ti = t - k (commit f56dc25)
-2. ✅ K normalization RMS — matches PyTorch (0.022)
-3. ✅ A_log / dt_bias values — match PyTorch exactly
-4. ✅ Gating values (beta, silu(gate)) — match PyTorch
-5. ✅ Output projection RMS — matches PyTorch (0.037)
+2. ✅ qkv_t index — fixed stride from `b*S*conv_dim + ti*conv_dim + c_dim` to `ti*conv_dim*S + c_dim*S`
+3. ✅ Full S+ck-1 conv output — compute on full padded output before truncating
+4. ✅ A_log/dt_bias — match PyTorch
+5. ✅ Out_proj weights — match PyTorch
+6. ✅ qkv_all matmul — matches PyTorch
 
-**Remaining issue:**
-- Per-element attention values differ even though RMS matches
-- Model generates tokens from many languages (Russian, Korean, Chinese) instead of English
-- The softmax distribution is shifted → wrong argmax
+### Remaining Issue
+The conv1d output RMS is close (C=0.096, PyTorch=0.11) but not exact. The first element matches (-0.0612), but subsequent elements differ. This causes downstream differences in V values (C=0.075 vs PyTorch=0.133), leading to wrong attention output.
 
-### Plan: Fix Per-Element Divergence
+---
 
-**Step 1: Full PyTorch reference dump (P0)**
-- Run PyTorch model to dump ALL intermediate tensors for each layer
-- Include: in_proj_qkv, conv1d_out, Q, K, V, z, beta, alpha/g, decay, state, y_all, out_proj
-- Compare element-by-element with C output
+## PLAN: Fix Conv1d Output Divergence (Next Session)
 
-**Step 2: Identify exact divergence point**
-- Check QKV projection: `in_proj_qkv` shape [6144, 1024] — is the matmul layout correct?
-- Check z projection: `in_proj_z` shape [2048, 1024] — verify loading and matmul
-- Check conv1d output: compare exact values, not just RMS
-- Check Q/K L2 normalization: verify no spurious division by head_dim
-- Check recurrence: verify S[h, i, j] = decay*S[h,i,j] + kv[i] * (v[j] - kv_mem[j]) * beta[h]
-- Check output: y[bs, h, d] = sum_i q[bs, h, i] * S[h, i, d] — verify einsum order
-- Check z-gating: RMSNorm(y) * silu(z) — verify weight application
-- Check output proj: out = y @ W_out.T — verify weight shape and matmul
+### P0: Element-by-Element conv1d Comparison
+1. Dump PyTorch conv1d input/output for all 3 timesteps and first 32 channels
+2. Dump C conv1d input/output for same positions
+3. Find exact timestep/channel where values first diverge
 
-**Step 3: Compare RoPE application**
-- Qwen3.5 applies RoPE to Q/K — check if it's applied before or after the linear attention
-- In gated_delta_net: RoPE is applied to Q/K in the GQA path, not the linear path
-- In linear_attn_forward: No explicit RoPE — check if input already has RoPE applied
+### P1: Check conv1d Weight Layout
+- PyTorch: `conv1d.weight` shape [6144, 1, 4], groups=6144, padding=3
+- C: `conv1d_w` loaded as flat [conv_dim * ck] = [24576]
+- Verify: C's `wc[k]` at index `c_dim * ck + k` matches PyTorch's `weight[c_dim, 0, k]`
+- Current C loads: l->conv1d_w[0]=-0.000161, [1]=0.000404, [2]=-0.003387, [3]=-0.074219
+- PyTorch weight[0] = [-0.000161, 0.000404, -0.003387, -0.074219] → ✅ MATCH
 
-**Step 4: Compare attention output projection**
-- The final layer output goes through lm_head
-- Check if lm_head weights are loaded correctly
-- Check temperature scaling: Qwen3.5 needs different temperature than GLM
+### P2: Check conv1d Computation
+- PyTorch conv1d: `out[c, t] = sum_k weight[c, 0, k] * input[c, t-(3-k)]`
+- C conv1d: `acc += qkv_t[ti*conv_dim*S + c_dim*S] * wc[k]` where `ti = t-(ck-1-k)`
+- For t=1, c_dim=0, k=2: PyTorch uses input[1-(3-2)] = input[0]
+- C uses qkv_t at ti=0, which should be qkv_all[0, 0] = 0.824031
+- Verify the qkv_t values match PyTorch's mixed_qkv_t
 
-**Step 5: Fix the identified issue and retest**
+### P3: Check Silu Application
+- PyTorch: `F.silu(conv_out)[:, :, :S]` — silu on full padded output, then truncate
+- C: applies silu after transpose back to [BS, conv_dim] — same result
+- The silu output should match: PyTorch conv_out_silu[0,0,0:3] = [-0.0296, -0.0131, -0.0316]
+- C conv1d_out after silu should match
+
+### P4: Check V Split
+- PyTorch: v_raw from conv_out_silu, shape [1, 3, 2048], RMS=0.1335
+- C: v_all from conv1d_out after silu, shape [3, 2048], RMS=0.0751
+- If conv1d_out matches, v_raw should match. If not, trace back to conv1d.
+
+### P5: Check Recurrence
+- If V matches, verify the gated delta rule recurrence produces correct state
+- Manual PyTorch recurrence vs fla's chunk_gated_delta_rule
+- State S[h, i, j] = decay*S + K * (V - K^T*S) * beta
+
+### P6: Check z-gating and Output
+- Verify RMSNormGated: RMSNorm(y) * weight * silu(z)
+- Verify out_proj: y @ W_out.T
+- Verify lm_head and temperature scaling
 
 ### Architecture Differences: Qwen3.5 vs GLM
 
