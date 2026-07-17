@@ -1537,6 +1537,12 @@ static void linear_attn_forward(Model *m, Layer *l, int layer,
      * g = -exp(A_log) * softplus(a + dt_bias) — log(alpha), always <= 0
      * All arrays use matmul layout: [BS, dim] */
     float *g_all = falloc((int64_t)BS * nq);
+    if(getenv("DEBUG_LINEAR") && layer==0){
+        fprintf(stderr,"[LIN] L%d: A_log[0]=%.6f A_log[1]=%.6f A_log[2]=%.6f A_log[3]=%.6f\n",
+            layer,l->A_log[0],l->A_log[1],l->A_log[2],l->A_log[3]);
+        fprintf(stderr,"[LIN] L%d: dt_bias[0]=%.6f dt_bias[1]=%.6f dt_bias[2]=%.6f dt_bias[3]=%.6f\n",
+            layer,l->dt_bias[0],l->dt_bias[1],l->dt_bias[2],l->dt_bias[3]);
+    }
     for(int bs = 0; bs < BS; bs++){
         for(int h = 0; h < nq; h++){
             float A = expf(l->A_log[h]);

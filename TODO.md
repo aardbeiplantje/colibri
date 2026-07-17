@@ -79,7 +79,7 @@
 ## Phase 8.3: Numerical Accuracy (Current Work)
 
 ### Symptom
-Model runs end-to-end from GGUF FP16 (all 488 tensors loaded), produces single repeated token ("The!!!!!!!!!!!!!!!!!!!!") instead of coherent English.
+Model runs end-to-end from GGUF FP16 (all 488 tensors loaded). Previously produced single repeated token ("The!!!!!!!!!!!!!!!!!!!!"). After conv1d fix (commit f56dc25), now produces "The cat sat fung unit SOVE..." — coherent-ish but wrong tokens.
 
 ### PyTorch Reference
 ```
@@ -87,10 +87,33 @@ on the floor, and the cat sat on the floor.
 The cat
 ```
 
-### C Output (FP16 GGUF, Temp=2.0)
+### C Output (FP16 GGUF, Temp=2.0, after conv1d fix)
 ```
-The!!!!!!!!!!!!!!!!!!!!
+The cat sat fung unit SOVE...
 ```
+
+### Key Metrics (Layer 0)
+| Metric | C | PyTorch | Status |
+|--------|---|---------|--------|
+| QKV RMS | ~same | ~same | ✅ |
+| K norm RMS | 0.022 | 0.022 | ✅ |
+| Attention RMS | 0.029 | 0.038 | ⚠️ close |
+| Attention first16 | different | [-0.648, 0.063, ...] | ⚠️ scale OK, values off |
+
+### Root Cause
+Conv1d kernel indexing was wrong: used `ti=t-(ck-1-k)` but should use `ti=t-k` because GGUF flat array layout differs from PyTorch in-memory layout. Fixed in commit f56dc25.
+
+### Remaining Issue
+Attention output values are scaled correctly (RMS=0.029 vs PyTorch 0.038) but individual values differ, causing wrong token selection. Possible causes:
+- Transpose/sign error in attention recurrence
+- z-gating or output projection mismatch
+- QKV projection weight loading order
+
+### Next Debug Steps
+1. Compare attention output values C vs PyTorch at per-element level
+2. Check if difference is consistent across all layers
+3. Verify attention recurrence: S = alpha*S + k*beta*(v - k^T*S), y = S^T@q
+4. Check z-gating: z = silu(in_proj_z(x_ln)), output = RMSNorm(y) * z
 
 ### Fixes Applied (in order)
 
