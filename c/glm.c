@@ -80,43 +80,18 @@ static void debug_layer_dump(int li, const char *label, const float *data, int n
     rms = sqrtf(rms / n); absmx = sqrtf(absmx);
     char key[64];
     snprintf(key, sizeof(key), "l%d_%s", li, label);
-    /* Always add trailing comma; strip last one in debug_layer_done */
+    /* Last measurement: layer_out of last layer (23), since mtp_absorb not called with DRAFT=0 */
+    int is_last = (li == 23 && strcmp(label, "layer_out") == 0) ? 1 : 0;
     debug_layer_bufpos += snprintf(debug_layer_buf + debug_layer_bufpos, sizeof(debug_layer_buf) - debug_layer_bufpos,
         "      \"%s\": {\n        \"rms\": %.8f,\n        \"first16\": [", key, rms);
     for(int i = 0; i < 16 && i < n; i++){
         if(i) debug_layer_bufpos += snprintf(debug_layer_buf + debug_layer_bufpos, sizeof(debug_layer_buf) - debug_layer_bufpos, ", ");
         debug_layer_bufpos += snprintf(debug_layer_buf + debug_layer_bufpos, sizeof(debug_layer_buf) - debug_layer_bufpos, "% .6f", data[i]);
     }
-    debug_layer_bufpos += snprintf(debug_layer_buf + debug_layer_bufpos, sizeof(debug_layer_buf) - debug_layer_bufpos, "]\n      },\n");
+    debug_layer_bufpos += snprintf(debug_layer_buf + debug_layer_bufpos, sizeof(debug_layer_buf) - debug_layer_bufpos, "]\n      }%s\n", is_last ? "" : ",");
 }
 static void debug_layer_done(int li){
     if(!debug_layer_bufpos) return;
-    /* Strip trailing comma from last measurement */
-    char *last_comma = NULL;
-    for(int i = debug_layer_bufpos - 9; i >= 0; i--){
-        if(debug_layer_buf[i] == ' ' && debug_layer_buf[i+1] == ' ' &&
-           debug_layer_buf[i+2] == ' ' && debug_layer_buf[i+3] == ' ' &&
-           debug_layer_buf[i+4] == ' ' && debug_layer_buf[i+5] == ' ' &&
-           debug_layer_buf[i+6] == '}' && debug_layer_buf[i+7] == ',' &&
-           debug_layer_buf[i+8] == '\n') {
-            int found_more = 0;
-            for(int j = i + 9; j < debug_layer_bufpos - 7; j++){
-                if(debug_layer_buf[j] == ' ' && debug_layer_buf[j+1] == ' ' &&
-                   debug_layer_buf[j+2] == ' ' && debug_layer_buf[j+3] == ' ' &&
-                   debug_layer_buf[j+4] == ' ' && debug_layer_buf[j+5] == ' ' &&
-                   debug_layer_buf[j+6] == '}' && debug_layer_buf[j+7] == ',' &&
-                   debug_layer_buf[j+8] == '\n') {
-                    found_more = 1;
-                    break;
-                }
-            }
-            if(!found_more){
-                last_comma = &debug_layer_buf[i + 7];
-                break;
-            }
-        }
-    }
-    if(last_comma) *last_comma = ' ';
     debug_layer_bufpos += snprintf(debug_layer_buf + debug_layer_bufpos, sizeof(debug_layer_buf) - debug_layer_bufpos, "    }\n  }\n");
     char fname[512];
     snprintf(fname, sizeof(fname), "debug_layer_%08x.json", debug_layer_hash);
@@ -1430,8 +1405,8 @@ static void linear_attn_forward(Model *m, Layer *l, int layer,
                     const float *wc = wc_base + (int64_t)c_dim * ck;
                     float acc = 0;
                     for(int k = 0; k < ck; k++){
-                        int ti = t - k;  /* PyTorch conv1d: weight[k] is applied to input[t-k], k=0→t, k=1→t-1,... */
-                        if(ti < 0) continue;
+                        int ti = t - (ck - 1 - k);  /* k=0 accesses t-(ck-1) [padded], k=ck-1 accesses t */
+                        if(ti < 0 || ti >= S) continue;
                         acc += qkv_t[(int64_t)bs*conv_dim*S + (int64_t)c_dim*S + ti] * wc[k];
                     }
                     out_c[c_dim*S + t] = acc;
