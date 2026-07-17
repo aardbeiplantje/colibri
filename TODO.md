@@ -115,60 +115,67 @@ The!!!!!!!!!!!!!!!!!!!!
 19. **FF4 quantization support** (FIXED) — matmul_fp4, embed_row, qt_matvec_rows.
 20. **GGUF v3 parser** (FIXED) — hash table memset, KV pair types, tensor offsets.
 
-### Verification Status
+### Verification Status (2026-07-17)
 
 | Check | Result |
 |---|---|
-| Q RMS vs PyTorch | 0.1234 vs 0.1230 ✅ matches |
-| K RMS vs PyTorch | 0.0541 vs 0.0542 ✅ matches |
-| conv1d output vs PyTorch | -0.0622 vs -0.0613 ✅ matches |
-| conv1d weights | [-0.0002, 0.0004, -0.0034, -0.0742] ✅ matches |
-| Attention Q·K dot product | ❌ **Differs from PyTorch** |
-| Output RMS (L0) | C: 0.0018, PyTorch: 0.041 (10-20x smaller) |
+| conv1d weights [0:4] | [-0.000161, 0.000404, -0.003387, -0.074219] ✅ matches PyTorch |
+| conv1d out[0,0] | C: -0.061159, PyTorch: -0.061159 ✅ matches |
+| conv1d out[0,1] | C: 0.000802, PyTorch: 0.000802 ✅ matches |
+| QKV all RMS | C: 1.2901, PyTorch: 1.2901 ✅ matches |
+| Input LN RMS | C: 1.2247, PyTorch: 1.2386 ✅ matches (within 1.1%) |
+| Z RMS | C: 0.9410, PyTorch: 0.9138 ✅ matches (within 3%) |
+| K RMS | C: 0.0884, PyTorch: 0.0221 ❌ **4x diff!** |
+| Attention output RMS | C: 0.1020, PyTorch: 0.0377 ❌ **2.7x diff!** |
+| Attention output first16 | C: [-1.80, -0.06, 0.16, ...], PyTorch: [-0.65, 0.06, -0.08, ...] ❌ **wrong signs & magnitudes** |
 | Final output | "The!!!!!!!!!" ❌ should be coherent English |
+
+### Key Findings
+
+- **conv1d is correct** — weights and outputs match PyTorch exactly
+- **Input layernorm is correct** — RMS matches within 1.1%
+- **QKV projection is correct** — RMS matches
+- **Z gating is correct** — RMS matches within 3%
+- **K values are wrong** — C K RMS=0.088 vs PyTorch K RMS=0.022 (4x diff)
+- **Attention output is wrong** — C RMS=0.102 vs PyTorch RMS=0.038 (2.7x diff)
+- **First divergence is in K normalization or the linear attention recurrence**
 
 ### Remaining Hypotheses for Divergence
 
-1. **RoPE** — Qwen3.5 uses `rope_theta=10^7` with `head_dim=256`. Only first 4 dimension pairs get significant rotation; last 124 pairs rotate negligibly. Is the C implementation matching PyTorch?
-2. **conv1d full output** — Only first few values checked. Need full 6144-channel tensor comparison.
-3. **Attention score computation** — Even small F16→F32 conversion errors in Q and K multiply through the QK^T dot product.
-4. **GGUF FP16 weight loading** — Is the dequantization of F16→F32 lossless?
-5. **GQA attention scores** — The softmax of QK^T/sqrt(d) may have slightly different values causing argmax flip.
+1. **K L2 normalization** — C computes `K / sqrt(sum(K^2) + eps)`. PyTorch uses `F.normalize(K, p=2, dim=-1)`. These should be identical but K values differ by 4x.
+2. **Linear attention recurrence** — The state update `S = decay*S + outer(K, delta)` may have a bug in the K^T @ S computation. Previously used wrong `torch.mv(state, kv)` instead of `torch.mv(state.T, kv)`.
+3. **Value head mapping** — C uses `vh = h * nv / nq` for mapping query heads to value heads. PyTorch uses a different mapping.
+4. **Output projection** — The `out_proj` matmul from `[BS, nv*vd]` to `[BS, D]` may have wrong weight loading or layout.
 
 ---
 
 ## Phase 8.4: Next Steps (Recommended Priority Order)
 
-### P0: Per-layer C vs PyTorch diff — find the *exact* divergence layer
+### P0: Debug K normalization and linear attention recurrence
 
-**This is the single most productive next step.** The TODO has `c/pytorch_ref.json` with PyTorch top-5 token logits.
+**K values are 4x different from PyTorch; attention output is 2.7x different.** The conv1d, input LN, QKV projection, and Z gating all match. The bug is in one of:
 
-1. Add a `DEBUG_LAYER` flag (like `DEBUG_LINEAR`) that dumps per-layer intermediate outputs (qkv projections, conv1d out, Q/K norms, attention scores, final logits) to a file
-2. Run the same prompt through PyTorch's `transformers` pipeline and dump intermediates
-3. Diff the two — find which layer's output first deviates by > 1% (relative RMS)
-4. This turns an open-ended "the model is wrong" problem into a targeted fix
+1. **K L2 normalization** — Compare raw K (before normalization) and K RMS (after normalization) against PyTorch. Use `DEBUG_LINEAR` to dump `k_all` values channel-by-channel.
+2. **Linear attention recurrence** — The state update `S = decay*S + outer(K, delta)` may have a bug:
+   - Previously tested with wrong PyTorch einsum: `torch.mv(state, kv)` vs correct `torch.mv(state.T, kv)`
+   - Verify the K^T @ S computation matches PyTorch for all heads
+3. **Value head mapping** — C uses `vh = h * nv / nq` for mapping query heads to value heads. Verify PyTorch uses the same mapping.
 
-### P1: Verify RoPE is applied correctly for Qwen3.5
+### P1: Verify conv1d full output (6144 channels)
 
-- Qwen3.5 uses `rope_theta=10^7` and `head_dim=256`
-- With theta=10^7, the frequency buckets are extremely sparse — most dimensions get near-zero rotation
-- This is correct by design, but the C implementation might be off by a factor
-- Compare RoPE output against PyTorch for a known input tensor
-
-### P2: Verify the conv1d output channel order
-
-- The TODO says conv1d output matches PyTorch within quantization error — but only checked first few values
-- Need to verify the **full conv1d output tensor** (6144 channels × BS) matches PyTorch
+- Already verified conv1d out[0,0] and out[0,1] match PyTorch
+- Need to check all 6144 channels for at least the first timestep
+- Use `DEBUG_LINEAR` to dump conv1d out for each channel
 - A single channel offset would cascade through Q/K/V splits
 
-### P3: Verify GGUF FP16 weight loading is lossless
+### P2: Verify GGUF FP16 weight loading is lossless
 
-- Q/K RMS matches PyTorch (0.1234 vs 0.1230)
-- But the **attention score computation** `Q @ K^T` uses dot products sensitive to small errors
-- Even tiny F16→F32 conversion errors in the GGUF loader multiply through
-- Compare the full attention score matrix against PyTorch
+- Q/K RMS matches PyTorch (0.1234 vs 0.1230) before normalization
+- But the **K values** are 4x different after normalization
+- Check if the K normalization itself is correct: `K / sqrt(sum(K^2) + eps)`
+- Compare the full K tensor against PyTorch
 
-### P4: FP4 conversion quality regression
+### P3: FP4 conversion quality regression
 
 - Once FP16 is working, test FP4 conversion:
   - Convert safetensors → GGUF FP4 using `convert_qwen36_fp4.py`
@@ -176,18 +183,28 @@ The!!!!!!!!!!!!!!!!!!!!
   - Compare output vs FP16 and vs PyTorch
   - Quantization error is likely to be the next bottleneck
 
-### P5: GPU backend integration for linear attention
+### P4: GPU backend integration for linear attention
 
 - Currently `linear_attn_forward()` is pure C (CPU)
 - The recurrence (sequential over t) is a poor GPU candidate
 - But the **pre-computation** (projections, L2 norm, gating) could be GPU-accelerated
 - Worth deferring until FP16 quality is verified
 
-### P6: Benchmark on Strix Halo (gfx1151)
+### P5: Benchmark on Strix Halo (gfx1151)
 
 - Once quality is fixed, add timing instrumentation
 - Measure prefill/decode throughput on target hardware
 - Memory profiling: current RSS ~2 GB, verify no leaks over long sequences
+
+### Tools Available
+
+- `DEBUG_LAYER=1` — dumps per-layer intermediate tensors to `c/debug_layer_*.json`
+- `DEBUG_LINEAR=1` — dumps detailed linear attention intermediates (conv1d, QKV, gating, state)
+- `c/pytorch_dump_layers.py` — dumps PyTorch layer outputs and intermediates
+- `c/pytorch_linear_debug.py` — focused linear attention comparison script
+- `c/compare_common.py` — compares C vs PyTorch measurements
+- `c/pytorch_ref_layers.json` — saved PyTorch reference data
+- `c/pytorch_linear_debug.json` — saved linear attention comparison data
 
 ---
 
