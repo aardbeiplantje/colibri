@@ -1410,47 +1410,55 @@ static void linear_attn_forward(Model *m, Layer *l, int layer,
     }
 
     /* Apply causal conv1d: grouped convolution with kernel=ck.
-     * PyTorch: conv1d(padding=ck-1, kernel_size=ck) then truncate to S.
-     * out[t] = sum_{j=0..ck-1} x[t-j] * wc[ck-1-j] */
+     * PyTorch: conv1d(padding=ck-1, kernel_size=ck) → [BS, conv_dim, S+ck-1]
+     * Then silu() on the full output, then truncate to S.
+     * out[t] = sum_{j=0..ck-1} x[t-(ck-1-j)] * wc[j]
+     * For k=0: wc[0] * x[t-(ck-1)] (oldest, padded)
+     * For k=ck-1: wc[ck-1] * x[t] (current) */
     if(getenv("DEBUG_LINEAR")){
         fprintf(stderr,"[LIN] L%d: conv1d_w=%p conv1d_n=%ld w[0]=%.6f w[1]=%.6f w[2]=%.6f w[3]=%.6f w[4]=%.6f w[100]=%.6f\n",
             layer,(void*)l->conv1d_w,l->conv1d_n,
             l->conv1d_w[0], l->conv1d_w[1], l->conv1d_w[2], l->conv1d_w[3],
             l->conv1d_w[4], l->conv1d_w[100]);
     }
+    int S_full = S + ck - 1;  /* 6 for S=3, ck=4 */
     if(l->conv1d_w && l->conv1d_n > 0){
-        float *qkv_c = falloc((int64_t)BS*conv_dim*S); /* conv output */
-        memset(qkv_c, 0, (int64_t)BS*conv_dim*S * sizeof(float));
+        /* Full conv output: [BS*1, conv_dim, S+ck-1], then truncate to S after silu */
+        float *qkv_c = falloc((int64_t)BS*conv_dim*S_full);
+        memset(qkv_c, 0, (int64_t)BS*conv_dim*S_full * sizeof(float));
         for(int b = 0; b < B; b++){
-            for(int t = 0; t < S; t++){
-                int bs = b*S + t;
+            for(int t = 0; t < S_full; t++){
                 const float *wc_base = l->conv1d_w;
-                float *out_c = qkv_c + (int64_t)bs*conv_dim*S;
+                float *out_c = qkv_c + (int64_t)b*conv_dim*S_full;
                 for(int c_dim = 0; c_dim < conv_dim; c_dim++){
                     const float *wc = wc_base + (int64_t)c_dim * ck;
                     float acc = 0;
                     for(int k = 0; k < ck; k++){
-                        int ti = t - k;  /* k=0 accesses t-(ck-1) [padded], k=ck-1 accesses t */
-                        if(ti < 0) continue;
-                        acc += qkv_t[(int64_t)bs*conv_dim*S + (int64_t)c_dim*S + ti] * wc[k];
+                        int ti = t - (ck - 1 - k);  /* match PyTorch: k=0→oldest, k=ck-1→current */
+                        if(ti < 0 || ti >= S) continue;
+                        /* qkv_t layout: [BS, conv_dim, S], index = bs*conv_dim*S + c_dim*S + t */
+                        int qkv_idx = (int64_t)ti * conv_dim * S + (int64_t)c_dim * S;
+                        acc += qkv_t[qkv_idx] * wc[k];
                     }
-                    out_c[c_dim*S + t] = acc;
+                    out_c[c_dim*S_full + t] = acc;
                 }
             }
         }
         if(getenv("DEBUG_LINEAR")){
-            float rms_c=0; for(int i=0;i<BS*conv_dim*S;i++) rms_c+=qkv_c[i]*qkv_c[i];
-            fprintf(stderr,"[LIN] L%d: conv1d_out_rms=%.6f conv1d_out[0]=%.6f conv1d_out[1]=%.6f conv1d_out[2]=%.6f conv1d_out[3]=%.6f\n",
-                layer, sqrtf(rms_c/(BS*conv_dim*S)), qkv_c[0], qkv_c[1], qkv_c[2], qkv_c[3]);
+            float rms_c=0; for(int i=0;i<BS*conv_dim*S_full;i++) rms_c+=qkv_c[i]*qkv_c[i];
+            fprintf(stderr,"[LIN] L%d: conv1d_out_rms=%.6f (full=%d) conv1d_out[0]=%.6f conv1d_out[1]=%.6f conv1d_out[2]=%.6f conv1d_out[3]=%.6f conv1d_out[4]=%.6f conv1d_out[5]=%.6f\n",
+                layer, sqrtf(rms_c/(BS*conv_dim*S_full)), S_full, qkv_c[0], qkv_c[1], qkv_c[2], qkv_c[3], qkv_c[4], qkv_c[5]);
         }
-        /* Transpose back: [BS, conv_dim, S] -> [BS, conv_dim] */
+        /* Transpose back: [BS, conv_dim, S_full] -> [BS, conv_dim], apply silu */
         for(int b = 0; b < B; b++){
-            for(int t = 0; t < S; t++){
-                int bs = b*S + t;
+            for(int t = 0; t < S_full; t++){
                 for(int c_dim = 0; c_dim < conv_dim; c_dim++){
-                    float v = qkv_c[(int64_t)bs*conv_dim*S + (int64_t)c_dim*S + t];
-                    /* Reference applies F.silu after conv1d */
-                    qkv_all[(int64_t)bs * conv_dim + c_dim] = siluf(v);
+                    float v = qkv_c[(int64_t)b*conv_dim*S_full + (int64_t)c_dim*S_full + t];
+                    /* Reference applies F.silu after conv1d, then truncates to S */
+                    if(t < S){
+                        /* qkv_all layout: [BS, conv_dim] = [bs*conv_dim + c_dim] */
+                        qkv_all[(int64_t)b*S*conv_dim + (int64_t)t*conv_dim + c_dim] = siluf(v);
+                    }
                 }
             }
         }
@@ -1570,7 +1578,9 @@ static void linear_attn_forward(Model *m, Layer *l, int layer,
         if(getenv("DEBUG_LINEAR") && t==0){
             float rms_k=0; for(int bs=0;bs<BS;bs++) for(int h=0;h<nq;h++) for(int d=0;d<kd;d++) rms_k += k_all[(int64_t)bs*nq*kd+(int64_t)h*kd+d]*k_all[(int64_t)bs*nq*kd+(int64_t)h*kd+d];
             float rms_v=0; for(int bs=0;bs<BS;bs++) for(int h=0;h<nv;h++) for(int d=0;d<vd;d++) rms_v += v_all[(int64_t)bs*nv*vd+(int64_t)h*vd+d]*v_all[(int64_t)bs*nv*vd+(int64_t)h*vd+d];
-            fprintf(stderr,"[LIN] L%d: t=0 k_rms=%.4f v_rms=%.4f\n",layer,sqrtf(rms_k/(nq*kd*BS)),sqrtf(rms_v/(nv*vd*BS)));
+            fprintf(stderr,"[LIN] L%d: t=0 k_rms=%.4f v_rms=%.4f k[0,0,0]=%.6f v[0,0,0]=%.6f\n",
+                layer,sqrtf(rms_k/(nq*kd*BS)),sqrtf(rms_v/(nv*vd*BS)),
+                k_all[0], v_all[0]);
         }
         for(int b = 0; b < B; b++){
             int64_t b_off = (int64_t)b * state_size;
@@ -1597,6 +1607,10 @@ static void linear_attn_forward(Model *m, Layer *l, int layer,
                 if(getenv("DEBUG_LINEAR") && t==0 && h==0){
                     fprintf(stderr,"[LIN] L%d: h=0 vh=%d bs=%d g=%.4f decay=%.6f beta=%.4f\n",
                         layer,vh,bs,g_val,decay,beta);
+                    fprintf(stderr,"[LIN] L%d: t=0 state[0,0:4,0:4]=\n", layer);
+                    for(int i=0;i<4;i++) for(int j=0;j<4;j++)
+                        fprintf(stderr,"  %.6f ", state[b_off + h_off + i*vd + j]);
+                    fprintf(stderr,"\n");
                 }
                 float kv_mem_local[128];
                 for(int j = 0; j < vd; j++){
