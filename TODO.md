@@ -501,3 +501,25 @@ When you restart this session:
 3. **Check model**: `ls ../Qwen3.5-0.8B/` — model files should be present
 4. **PyTorch reference**: Compare `c/pytorch_ref.json` with C output
 5. **Do NOT commit/push** without explicit request
+
+## GLM-5.2 FP16 Support Issue (2026-07-22)
+
+### Problem
+The C engine's `expert_load` function in `c/glm.c` assumes all GGUF files have quantization scales (`.weight.scales` tensors). FP16 GGUF files don't have these scales, causing the code to fail.
+
+### Root Cause
+The code at line 2460 checks `if(!tw[k]||!tq[k])` and exits if scales don't exist. This prevents FP16 models from loading.
+
+### Fix Needed
+1. Check if scales exist before requiring them
+2. Handle non-quantized tensors (FP16) by setting `scales = NULL`
+3. Update all code that uses `scales` to handle NULL
+
+### Status
+- FP16 GGUF conversion works
+- PyTorch inference works (deterministic output)
+- C CPU backend: BUG in expert loading (expects quantization scales)
+- C HIP backend: Not tested (CPU bug blocks it)
+
+### Next Steps
+Fix `expert_load` to handle both quantized (FP4/FP8) and non-quantized (FP16) tensors.
