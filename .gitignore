@@ -54,3 +54,7 @@ Qwen3.5-0.8B
 c/debug_layer_*.json
 
 *.gguf
+
+# GLM-5.2 tiny test model (for debugging)
+glm_tiny_random/
+glm_tiny_random.gguf
