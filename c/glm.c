@@ -2456,14 +2456,16 @@ static void expert_load(Model *m, int layer, int eid, ESlot *s){
     }
     gguf_tensor *tw[3], *tq[3];
     char qsuf[3][1024];
+    int has_scales=1;  /* assume quantized, set to 0 if no scales found (like llama.cpp TENSOR_NOT_REQUIRED) */
     for(int k=0;k<3;k++){
         tw[k]=st_find(&m->S,nm[k]);
+        if(!tw[k]){ fprintf(stderr,"missing %s\n",nm[k]); exit(1); }
         snprintf(qsuf[k],sizeof(qsuf[k]),"%s.scales",nm[k]);
         tq[k]=st_find(&m->S,qsuf[k]);
-        if(!tw[k]||!tq[k]){ fprintf(stderr,"missing %s\n",nm[k]); exit(1); }
+        if(!tq[k]) has_scales=0;  /* FP16/FP8 without scales */
     }
     int64_t wtot=_gguf_nbytes(&m->S,nm[0])+_gguf_nbytes(&m->S,nm[1])+_gguf_nbytes(&m->S,nm[2]);
-    int64_t ftot=_gguf_nbytes(&m->S,qsuf[0])+_gguf_nbytes(&m->S,qsuf[1])+_gguf_nbytes(&m->S,qsuf[2]);
+    int64_t ftot=has_scales ? (_gguf_nbytes(&m->S,qsuf[0])+_gguf_nbytes(&m->S,qsuf[1])+_gguf_nbytes(&m->S,qsuf[2])) : 0;
     (void)wtot; (void)ftot; /* suppress unused-variable warning when COLI_HIP is defined */
 #ifdef COLI_HIP
     /* HIP/UMA path: mmap each expert tensor. The GPU walks the mmap'd pages directly
@@ -2480,7 +2482,8 @@ static void expert_load(Model *m, int layer, int eid, ESlot *s){
             int fmt = (nb==(int64_t)OO[k]*II[k])?1 : (nb==(int64_t)OO[k]*((II[k]+1)/2))?2 : 3;  /* int8/int4/int2 */
             if(b==4 && nb==(int64_t)OO[k]*((II[k]+1)/2)) fmt=4;  /* FP4: same bytes as INT4 */
             qt[k]->fmt=fmt; qt[k]->O=OO[k]; qt[k]->I=II[k]; qt[k]->qf=NULL;
-            qt[k]->q8=(int8_t*)wmp; qt[k]->q4=(uint8_t*)wmp; qt[k]->s=wt->scales;  /* scales from GGUF */
+            qt[k]->q8=(int8_t*)wmp; qt[k]->q4=(uint8_t*)wmp;
+            qt[k]->s = has_scales ? wt->scales : NULL;  /* scales from GGUF, or NULL for FP16 */
         }
         s->slab = (uint8_t*)tw[0]->mmap_ptr; /* store first weight mmap ptr for cleanup */
         s->eid=eid; return;
@@ -2500,33 +2503,51 @@ static void expert_load(Model *m, int layer, int eid, ESlot *s){
     float *fp[3]; int64_t fo=0;  /* scale buffers */
     
     for(int k=0;k<3;k++){
-        int64_t wnb = _gguf_nbytes(&m->S, nm[k]);
-        int64_t qnb = _gguf_nbytes(&m->S, qsuf[k]);
+        gguf_tensor *wt = tw[k];
+        int64_t numel = 1;
+        for(int d=0; d<wt->ndim; d++) numel *= wt->shape[d];
+        int64_t wnb = numel * 4;  /* Always store as F32 after gguf_read_tensor conversion */
         
-        /* Read weight tensor */
-        float *tmp_w = falloc(wnb/4);  /* assuming F32 storage */
+        /* Read weight tensor (gguf_read_tensor converts F16->F32) */
+        float *tmp_w = falloc(numel);
         int64_t wn = 0;
         gguf_read_tensor(&m->S, nm[k], tmp_w, &wn);
         memcpy(s->slab + pos[k], tmp_w, wnb);
         free(tmp_w);
-        pos[k+1] = pos[k] + wnb;  /* next expert offset */
+        if(k < 2) pos[k+1] = pos[k] + wnb;  /* next expert offset */
         
-        /* Read scale tensor */
-        int64_t sn = 0;
-        float *tmp_s = falloc(qnb/4);
-        gguf_read_tensor(&m->S, qsuf[k], tmp_s, &sn);
-        memcpy(s->fslab + fo, tmp_s, qnb);
-        fp[k] = s->fslab + fo;
-        fo += qnb/4;
-        free(tmp_s);
+        /* Read scale tensor (only if has_scales, like llama.cpp's if (w_s)) */
+        if(has_scales){
+            int64_t qnb = _gguf_nbytes(&m->S, qsuf[k]);
+            int64_t sn = 0;
+            float *tmp_s = falloc(qnb/4);
+            gguf_read_tensor(&m->S, qsuf[k], tmp_s, &sn);
+            memcpy(s->fslab + fo, tmp_s, qnb);
+            fp[k] = s->fslab + fo;
+            fo += qnb/4;
+            free(tmp_s);
+        } else {
+            fp[k] = NULL;  /* No scales for FP16 */
+        }
     }
     QT *qt[3]={&s->g,&s->u,&s->d}; int OO[3]={I,I,D}, II[3]={D,D,I};
     for(int k=0;k<3;k++){
         int64_t nb=tw[k]->nbytes;
-        int fmt = (nb==(int64_t)OO[k]*II[k])?1 : (nb==(int64_t)OO[k]*((II[k]+1)/2))?2 : 3;  /* int8/int4/int2 */
-        if(b==4 && nb==(int64_t)OO[k]*((II[k]+1)/2)) fmt=4;  /* FP4: same bytes as INT4 */
+        int64_t expected_f32 = (int64_t)OO[k]*II[k]*4;  /* F32 bytes */
+        int64_t expected_f16 = (int64_t)OO[k]*II[k]*2;  /* F16 bytes */
+        int fmt;
+        if(nb == expected_f32 || nb == expected_f16) {
+            fmt = 0;  /* F32 or F16 (stored as F32 in slab) */
+        } else if(nb == (int64_t)OO[k]*II[k]) {
+            fmt = 1;  /* INT8 */
+        } else if(nb == (int64_t)OO[k]*((II[k]+1)/2)) {
+            fmt = (b==4) ? 4 : 2;  /* FP4 or INT4 */
+        } else {
+            fmt = 3;  /* INT2 fallback */
+        }
         qt[k]->fmt=fmt; qt[k]->O=OO[k]; qt[k]->I=II[k]; qt[k]->qf=NULL;
-        qt[k]->q8=(int8_t*)(s->slab+pos[k]); qt[k]->q4=s->slab+pos[k]; qt[k]->s=fp[k];
+        qt[k]->q8=(int8_t*)(s->slab+pos[k]); qt[k]->q4=s->slab+pos[k];
+        qt[k]->s = has_scales ? fp[k] : NULL;
     }
     s->eid=eid;
 #endif
