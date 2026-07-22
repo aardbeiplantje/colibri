@@ -58,3 +58,5 @@ c/debug_layer_*.json
 # GLM-5.2 tiny test model (for debugging)
 glm_tiny_random/
 glm_tiny_random.gguf
+*.json
+llama.cpp
