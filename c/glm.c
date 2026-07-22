@@ -1425,8 +1425,8 @@ static void linear_attn_forward(Model *m, Layer *l, int layer,
         for(int t = 0; t < S; t++){
             int bs = b*S + t;  /* bs indexes the input timestep */
             for(int c_dim = 0; c_dim < conv_dim; c_dim++){
-                /* qkv_t[bs, c_dim, 0] = qkv_all[bs, c_dim] — all timesteps get same value */
-                qkv_t[(int64_t)bs*conv_dim*S + (int64_t)c_dim*S] =
+                /* qkv_t[bs, c_dim, t] = qkv_all[bs, c_dim] */
+                qkv_t[(int64_t)bs*conv_dim*S + (int64_t)c_dim*S + t] =
                     qkv_all[(int64_t)bs * conv_dim + c_dim];
             }
         }
@@ -1459,9 +1459,8 @@ static void linear_attn_forward(Model *m, Layer *l, int layer,
                     for(int k = 0; k < ck; k++){
                         int ti = t - (ck - 1 - k);  /* match PyTorch: k=0→oldest, k=ck-1→current */
                         if(ti < 0 || ti >= S) continue;
-                        /* qkv_t layout: [BS, conv_dim, S], index = bs*conv_dim*S + c_dim*S + t */
-                        int qkv_idx = (int64_t)ti * conv_dim * S + (int64_t)c_dim * S;
-                        /* qkv_t[bs, c_dim, 0] = qkv_all[bs, c_dim] — value at timestep bs */
+                        /* qkv_t layout: [BS, conv_dim, S], index = b*conv_dim*S + c_dim*S + t */
+                        int qkv_idx = (int64_t)b * conv_dim * S + (int64_t)c_dim * S + ti;
                         acc += qkv_t[qkv_idx] * wc[k];
                     }
                     out_c[c_dim*S_full + t] = acc;

@@ -414,19 +414,29 @@ disk (GGUF) → mmap() → host_ptr → hipHostRegister → hipHostGetDevicePoin
 | out_rms (layer 0) | 0.0180 | 0.0297 | 0.61 |
 | out_first4[0] | -0.156883 | -0.334720 | 0.47 |
 
-### Debug Findings
+### Debug Findings (2026-07-22)
 
-1. **conv1d**: Matches PyTorch exactly (weights and output)
-2. **QKV projection**: Matches PyTorch (RMS=1.2312)
-3. **K L2 normalization**: Matches PyTorch (RMS=0.0221)
-4. **RMSNormGated**: Close but not exact (0.0648 vs 0.0699)
-5. **Output projection**: 2x difference (0.0180 vs 0.0297)
+**Fixed bugs:**
+1. **conv1d index bug** — qkv_t population and conv1d computation had wrong indices (FIXED)
+2. **qkv_idx calculation** — Missing batch index in conv1d (FIXED)
+
+**Remaining issues:**
+1. **Input layernorm output** — C x_in[0:4] = [0.26, -1.04, -0.88, 1.27] vs PyTorch x_ln[0, 0:4] = [0.05, -2.71, -0.51, -0.34]
+2. **QKV projection** — C qkv_all[0:1] = [-0.56, -0.86] vs PyTorch qkv_all[0:1, 0] = [0.82, 0.32]
+3. **conv1d RMS** — C = 0.086 vs PyTorch = 0.110 (22% diff)
+4. **Final output RMS** — C = 0.018 vs PyTorch = 0.030 (40% diff)
 
 ### Suspected Root Causes
 
-1. **State update computation** — The gated delta rule may have a bug in the K^T @ S or outer product
-2. **Output computation** — The y = Q @ S.T may have a layout issue
-3. **Value head mapping** — The vh = h * nv / nq mapping may be incorrect
+1. **GGUF embedding values** — May be different from PyTorch safetensors
+2. **Input layernorm weight** — May not be loaded correctly from GGUF
+3. **QKV projection weight** — May have wrong layout or values
+
+### Next Steps
+
+1. Verify GGUF embedding tensor values match PyTorch
+2. Check input layernorm weight loading
+3. Debug QKV projection step by step
 
 ### Debug Commands
 
