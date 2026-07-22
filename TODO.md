@@ -18,7 +18,7 @@
 | **MTP speculative decoding** | ✅ int8 heads, 2.2-2.8 tok/forward |
 | **Grammar-forced drafts** | ✅ GBNF, ~1.0 acceptance on structured output |
 | **CUDA backend** | ✅ Pinned expert tier |
-| **HIP/ROCm gfx1151** | ✅ Compiles, mmap zero-copy |
+| **HIP/ROCm gfx1151** | ✅ Compiles, mmap zero-copy, hipHostRegister |
 | **FP4 OCP E2M1** | ✅ CPU + GPU kernels, 40/40 tests |
 | **GGUF v3 parser** | ✅ Loads 488 tensors (F32/F16/NVFP4/NVFP8) |
 | **Safetensors → GGUF converter** | ✅ FP16 (lossless), FP8-E4M3, FP4-E2M1 |
@@ -343,9 +343,75 @@ The cat sat andre ... HTTP Cair Calabria 过年 表述 destinado
 
 ---
 
+## Phase 8.5: HIP/UMA Zero-Copy Verification ✅
+
+### Status (2026-07-22)
+
+**HIP backend with mmap zero-copy is working on gfx1151 (Strix Halo).**
+
+| Component | Status |
+|---|---|
+| **hipHostRegister + hipHostGetDevicePointer** | ✅ Used instead of hipMemcpy for expert weights |
+| **mmap() page alignment fix** | ✅ Fixed in `gguf_mmap()` — rounds down to page boundary |
+| **UMA direct GPU access** | ✅ GPU walks mmap'd GGUF file pages directly |
+| **hipMemcpy for input/output** | ✅ Only x (input) and y (output) use memcpy |
+| **Expert weights** | ✅ Zero-copy via `coli_hip_tensor_upload()` |
+
+### Key Implementation Details
+
+**`coli_hip_tensor_upload()`** (backend_hip.cu):
+```c
+// Register host memory (mmap'd GGUF tensor)
+HIP_CHECK(hipHostRegister((void *)weights, t->weight_bytes, hipHostRegisterMapped), ...);
+t->host_ptr = (void *)weights;
+t->is_mmap = 1;
+
+// Get device pointer — on UMA this is same as host_ptr
+HIP_CHECK(hipHostGetDevicePointer((void **)&t->weights, (void *)weights, 0), ...);
+```
+
+**`gguf_mmap()`** (gguf.h) — page alignment fix:
+```c
+// mmap requires page-aligned offset; round down and adjust
+long page_size = sysconf(_SC_PAGESIZE);
+int64_t offset_aligned = t->off & ~(page_size - 1);
+int64_t offset_adjust = t->off - offset_aligned;
+void *ptr = mmap(NULL, t->nbytes + offset_adjust, PROT_READ, MAP_SHARED, ctx->fd, offset_aligned);
+t->mmap_ptr = (char*)ptr + offset_adjust;
+```
+
+**Memory flow**:
+```
+disk (GGUF) → mmap() → host_ptr → hipHostRegister → hipHostGetDevicePointer → GPU
+                                                    ↓
+                                            zero-copy (UMA)
+```
+
+**Verification**:
+- `COLI_HIP=1 HIP_EXPERT_GB=2 ./glm 64 8 8 ../glm_tiny_random_glmmoe.gguf`
+- No "mmap weight failed" errors
+- `[HIP] mode: routed experts only (resident dense on CPU)`
+- GPU accesses expert weights directly via UMA
+
+### Next Steps
+
+1. **FP16 GGUF support** — Fix `expert_load()` to handle FP16 without scales
+2. **Linear attention on HIP** — Port `linear_attn_forward()` to HIP kernels
+3. **Benchmark** — Measure throughput vs CPU-only
+
+---
+
 ## Phase 8.4: Next Steps (Recommended Priority Order)
 
 ### P0: Debug K normalization and linear attention recurrence
+
+**K values are 4x different from PyTorch; attention output is 2.7x different.** The conv1d, input LN, QKV projection, and Z gating all match. The bug is in one of:
+
+1. **K L2 normalization** — Compare raw K (before normalization) and K RMS (after normalization) against PyTorch. Use `DEBUG_LINEAR` to dump `k_all` values channel-by-channel.
+2. **Linear attention recurrence** — The state update `S = decay*S + outer(K, delta)` may have a bug:
+   - Previously tested with wrong PyTorch einsum: `torch.mv(state, kv)` vs correct `torch.mv(state.T, kv)`
+   - Verify the K^T @ S computation matches PyTorch for all heads
+3. **Value head mapping** — C uses `vh = h * nv / nq` for mapping query heads to value heads. Verify PyTorch uses the same mapping.
 
 **K values are 4x different from PyTorch; attention output is 2.7x different.** The conv1d, input LN, QKV projection, and Z gating all match. The bug is in one of:
 
