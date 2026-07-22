@@ -70,11 +70,13 @@ static void debug_layer_init(const char *prompt){
     for(const char *p = prompt; *p; p++) debug_layer_hash = debug_layer_hash * 31 + *p;
     snprintf(fname, sizeof(fname), "debug_layer_%08x.json", debug_layer_hash);
     fprintf(stderr, "[DEBUG_LAYER] init hash=0x%08x file=%s\n", debug_layer_hash, fname);
+    fflush(stderr);
     debug_layer_bufpos = 0;
     debug_layer_bufpos += snprintf(debug_layer_buf + debug_layer_bufpos, sizeof(debug_layer_buf) - debug_layer_bufpos, "{\n  \"prompt\": \"%s\",\n  \"n_layers\": 25,\n  \"layers\": {\n", prompt);
 }
 static void debug_layer_dump(int li, const char *label, const float *data, int n, int S){
     if(!debug_layer_bufpos) return;
+    if(debug_layer_bufpos > (int)(sizeof(debug_layer_buf) - 600)) return; /* guard against overflow */
     float rms = 0, absmx = 0;
     for(int i=0; i<n; i++){ float v = data[i]*data[i]; rms += v; if(v>absmx) absmx = v; }
     rms = sqrtf(rms / n); absmx = sqrtf(absmx);
@@ -120,10 +122,17 @@ static void debug_layer_done(int li){
     debug_layer_bufpos += snprintf(debug_layer_buf + debug_layer_bufpos, sizeof(debug_layer_buf) - debug_layer_bufpos, "    }\n  }\n");
     char fname[512];
     snprintf(fname, sizeof(fname), "debug_layer_%08x.json", debug_layer_hash);
+    fprintf(stderr, "[DEBUG_LAYER] writing file=%s bufpos=%d\n", fname, debug_layer_bufpos);
+    fflush(stderr);
     FILE *fp = fopen(fname, "w");
     if(fp){
         fprintf(fp, "%s", debug_layer_buf);
         fclose(fp);
+        fprintf(stderr, "[DEBUG_LAYER] file written OK\n");
+        fflush(stderr);
+    } else {
+        fprintf(stderr, "[DEBUG_LAYER] FAILED to open file\n");
+        fflush(stderr);
     }
     debug_layer_bufpos = 0;
 }
@@ -852,13 +861,19 @@ static void rmsnorm(float *out, const float *x, const float *w, int D, float eps
     double ms=0; for(int i=0;i<D;i++) ms+=(double)x[i]*x[i];
     float r=1.f/sqrtf((float)(ms/D)+eps); for(int i=0;i<D;i++) out[i]=x[i]*r*w[i];
 }
-/* ── Qwen3.5 RMSNorm: out = x / sqrt(mean(x^2)+eps) * (1.0 + w) ──────────────────── */
+/* ── Qwen3.5 RMSNorm: out = x / sqrt(mean(x^2)+eps) * w ────────────────────────────
+ * The GGUF stores the FULL weight (not raw zeros). PyTorch uses weight directly,
+ * NOT (1+weight). The comment above was misleading — PyTorch initializes weight=1.0
+ * (learned parameter), not zero-init with (1+weight) trick. */
 static void rmsnorm_qw35(float *out, const float *x, const float *w, int D, float eps){
-    /* Qwen3.5: PyTorch initializes weight as zeros and computes (1+weight)*norm(x).
-     * The GGUF stores the raw weight (not 1+weight). */
+    /* Qwen3_5RMSNorm: _norm(x) * (1.0 + weight)
+     * PyTorch initializes weight=0, so effective multiplier starts at 1.0.
+     * The GGUF stores the TRAINED delta weights.  We must use (1.0+w),
+     * NOT raw w — otherwise the LN output is ~4.7× too small.
+     * See: modeling_qwen3_5.py → class Qwen3_5RMSNorm.forward() */
     double ms=0; for(int i=0;i<D;i++) ms+=(double)x[i]*x[i];
     float r=1.f/sqrtf((float)(ms/D)+eps);
-    for(int i=0;i<D;i++){ float wf=1.0f+w[i]; out[i]=x[i]*r*wf; }
+    for(int i=0;i<D;i++) out[i]=x[i]*r*(1.f+w[i]);
 }
 /* LayerNorm classica (media+varianza, weight+bias) — usata dal k_norm dell'indexer DSA */
 static void layernorm(float *v, const float *w, const float *b, int n, float eps){
@@ -1341,6 +1356,9 @@ static void gated_delta_net(Model *m, Layer *l, int layer,
  * and full layers use standard GQA attention. */
 static void linear_attn_forward(Model *m, Layer *l, int layer,
                                  const float *x_in, int B, int S, int pos_base, float *out){
+    if(getenv("DEBUG_LINEAR")){
+        fprintf(stderr,"[LIN] L%d: ENTER linear_attn_forward B=%d S=%d\n", layer, B, S);
+    }
     Cfg *c = &m->c;
     int D = c->hidden;
     int nq = c->linear_num_key_heads;
@@ -1368,9 +1386,11 @@ static void linear_attn_forward(Model *m, Layer *l, int layer,
     matmul_qt(qkv_all, x_in, &l->in_proj_qkv, BS);  /* matmul produces [BS, conv_dim] layout */
     if(getenv("DEBUG_LINEAR") && layer==0){
         /* Debug: dump first 10 in_proj_qkv weight values for comparison with PyTorch */
-        fprintf(stderr,"[LIN] L%d: in_proj_qkv weight[0]=%.8f weight[1]=%.8f weight[1023]=%.8f weight[1024]=%.8f\n",
-            layer, l->in_proj_qkv.qf[0], l->in_proj_qkv.qf[1],
-            l->in_proj_qkv.qf[1023], l->in_proj_qkv.qf[1024]);
+        float rms_in=0; for(int i=0;i<D;i++) rms_in+=x_in[i]*x_in[i];
+        /* Debug: check input_layernorm weight */
+        float rms_ln=0; for(int i=0;i<D;i++) rms_ln+=l->in_ln[i]*l->in_ln[i];
+        fprintf(stderr,"[LIN] L%d: x_in RMS=%.4f in_ln_weight RMS=%.4f x_in[0:4]=[%.6f %.6f %.6f %.6f]\n",
+            layer,sqrtf(rms_in/D),sqrtf(rms_ln/D),x_in[0],x_in[1],x_in[2],x_in[3]);
         fprintf(stderr,"[LIN] L%d: in_proj_qkv qf[100]=%.8f qf[101]=%.8f qf[102]=%.8f qf[103]=%.8f qf[104]=%.8f\n",
             layer, l->in_proj_qkv.qf[100], l->in_proj_qkv.qf[101],
             l->in_proj_qkv.qf[102], l->in_proj_qkv.qf[103], l->in_proj_qkv.qf[104]);
@@ -1508,31 +1528,24 @@ static void linear_attn_forward(Model *m, Layer *l, int layer,
         if(!nf) fprintf(stderr,"[LIN] L%d: All arrays NaN-free\n",layer);
     }
 
-    /* L2 normalize Q and K per head, per batch element. Layout: [BS, nq*kd].
-     * PyTorch: F.normalize(Q, p=2, dim=-1) = x / sqrt(sum(x^2) + eps).
-     * NOTE: Do NOT divide sum-of-squares by kd before sqrt — that would
-     * introduce a spurious √kd scaling factor. Match PyTorch exactly. */
+    /* L2 normalize Q and K per-row (across all nq*kd channels), per batch element.
+     * Layout: [BS, nq*kd]. PyTorch: F.normalize(Q, p=2, dim=-1) = x / sqrt(sum(x^2) + eps).
+     * The Qwen3.5 model normalizes the entire row vector, NOT per-head. */
     for(int bs = 0; bs < BS; bs++){
-        for(int h = 0; h < nq; h++){
-            float l2 = 0;
-            for(int d = 0; d < kd; d++)
-                l2 += q_all[(int64_t)bs*nq*kd + (int64_t)h*kd + d] * q_all[(int64_t)bs*nq*kd + (int64_t)h*kd + d];
-            /* NO l2 /= (float)kd — raw L2 norm like PyTorch F.normalize */
-            float inv_l2 = (l2 > 0) ? 1.0f/sqrtf(l2 + 1e-6f) : 0;
-            for(int d = 0; d < kd; d++)
-                q_all[(int64_t)bs*nq*kd + (int64_t)h*kd + d] *= inv_l2;
-        }
+        float l2 = 0;
+        for(int i = 0; i < nq * kd; i++)
+            l2 += q_all[(int64_t)bs*nq*kd + i] * q_all[(int64_t)bs*nq*kd + i];
+        float inv_l2 = (l2 > 0) ? 1.0f/sqrtf(l2 + 1e-6f) : 0;
+        for(int i = 0; i < nq * kd; i++)
+            q_all[(int64_t)bs*nq*kd + i] *= inv_l2;
     }
     for(int bs = 0; bs < BS; bs++){
-        for(int h = 0; h < nq; h++){
-            float l2 = 0;
-            for(int d = 0; d < kd; d++)
-                l2 += k_all[(int64_t)bs*nq*kd + (int64_t)h*kd + d] * k_all[(int64_t)bs*nq*kd + (int64_t)h*kd + d];
-            /* NO l2 /= (float)kd — raw L2 norm like PyTorch F.normalize */
-            float inv_l2 = (l2 > 0) ? 1.0f/sqrtf(l2 + 1e-6f) : 0;
-            for(int d = 0; d < kd; d++)
-                k_all[(int64_t)bs*nq*kd + (int64_t)h*kd + d] *= inv_l2;
-        }
+        float l2 = 0;
+        for(int i = 0; i < nq * kd; i++)
+            l2 += k_all[(int64_t)bs*nq*kd + i] * k_all[(int64_t)bs*nq*kd + i];
+        float inv_l2 = (l2 > 0) ? 1.0f/sqrtf(l2 + 1e-6f) : 0;
+        for(int i = 0; i < nq * kd; i++)
+            k_all[(int64_t)bs*nq*kd + i] *= inv_l2;
     }
     if(getenv("DEBUG_LINEAR")){
         float k_rms=0; for(int bs=0;bs<BS;bs++) for(int h=0;h<nq;h++) for(int d=0;d<kd;d++) k_rms += k_all[(int64_t)bs*nq*kd+(int64_t)h*kd+d]*k_all[(int64_t)bs*nq*kd+(int64_t)h*kd+d];
@@ -1547,6 +1560,11 @@ static void linear_attn_forward(Model *m, Layer *l, int layer,
     /* 4) Z, A, B projections (from separate weight tensors)
      * matmul produces [BS, dim] layout. */
     matmul_qt(z_all, x_in, &l->in_proj_z, BS);    /* [BS, nv*vd] */
+    if(getenv("DEBUG_LINEAR") && layer==0){
+        float rms_z=0; for(int i=0;i<nv*vd;i++) rms_z+=z_all[i]*z_all[i];
+        fprintf(stderr,"[LIN] L%d: z_rms_DEBUG=%.4f z_all[0:4]=[%.6f %.6f %.6f %.6f]\n",
+            layer,sqrtf(rms_z/(nv*vd)),z_all[0],z_all[1],z_all[2],z_all[3]);
+    }
     matmul_qt(a_all, x_in, &l->in_proj_a, BS);    /* [BS, nq] */
     matmul_qt(b_all, x_in, &l->in_proj_b, BS);    /* [BS, nq] */
     if(getenv("DEBUG_LINEAR")){
@@ -1669,7 +1687,8 @@ static void linear_attn_forward(Model *m, Layer *l, int layer,
 
     /* 7) Z gating + RMSNorm: match Qwen3_5RMSNormGated(core_attn, z)
      * = RMSNorm(core_attn) * weight * silu(z)
-     * z_all uses [BS, nv*vd] layout from matmul. y_all uses [BS, nv*vd] layout. */
+     * z_all uses [BS, nv*vd] layout from matmul. y_all uses [BS, nv*vd] layout.
+     * PyTorch normalizes per-row (across all nv*vd=2048 elements), NOT per-head. */
     if(getenv("DEBUG_LINEAR") && layer==0 && B==1){
         fprintf(stderr,"[LIN] L%d: z_all[0]=%.6f z_all[1]=%.6f z_all[2]=%.6f z_all[3]=%.6f\n",
             layer, z_all[0], z_all[1], z_all[2], z_all[3]);
@@ -1678,19 +1697,28 @@ static void linear_attn_forward(Model *m, Layer *l, int layer,
             layer,
             siluf(z_all[0]), siluf(z_all[1]), siluf(z_all[2]), siluf(z_all[3]));
     }
+    /* Debug: print y_all RMS before RMSNormGated */
+    if(getenv("DEBUG_LINEAR")){
+        float rms_y_before=0; for(int bs=0;bs<BS;bs++) for(int i=0;i<nv*vd;i++) rms_y_before += y_all[(int64_t)bs*nv*vd+i]*y_all[(int64_t)bs*nv*vd+i];
+        rms_y_before=sqrtf(rms_y_before/(BS*nv*vd));
+        fprintf(stderr,"[LIN] L%d: y_all_rms_BEFORE_rmsnorm=%.6f\n", layer, rms_y_before);
+    }
     for(int bs = 0; bs < BS; bs++){
-        for(int h = 0; h < nv; h++){
-            float *yo = y_all + (int64_t)bs*nv*vd + (int64_t)h*vd;
-            const float *zo = z_all + (int64_t)bs*nv*vd + (int64_t)h*vd;
-            float rms=0;
-            for(int d=0;d<vd;d++) rms += yo[d]*yo[d];
-            rms = sqrtf(rms/vd + c->eps);
-            float *ln_w = l->ln_w;  /* Qwen3_5RMSNormGated weight, shape [vd] */
-            for(int d = 0; d < vd; d++){
-                float wf = ln_w ? ln_w[d] : 1.0f;
-                yo[d] = (yo[d] / rms * wf) * siluf(zo[d]);
-            }
+        float rms=0;
+        for(int i = 0; i < nv * vd; i++)
+            rms += y_all[(int64_t)bs*nv*vd + i] * y_all[(int64_t)bs*nv*vd + i];
+        rms = sqrtf(rms / (nv * vd) + c->eps);
+        float *ln_w = l->ln_w;  /* Qwen3_5RMSNormGated weight, shape [vd], shared across all heads */
+        for(int i = 0; i < nv * vd; i++){
+            float wf = ln_w ? ln_w[i % vd] : 1.0f;
+            y_all[(int64_t)bs*nv*vd + i] = (y_all[(int64_t)bs*nv*vd + i] / rms * wf) * siluf(z_all[(int64_t)bs*nv*vd + i]);
         }
+    }
+    /* Debug: print y_all RMS after RMSNormGated */
+    if(getenv("DEBUG_LINEAR")){
+        float rms_y_after=0; for(int bs=0;bs<BS;bs++) for(int i=0;i<nv*vd;i++) rms_y_after += y_all[(int64_t)bs*nv*vd+i]*y_all[(int64_t)bs*nv*vd+i];
+        rms_y_after=sqrtf(rms_y_after/(BS*nv*vd));
+        fprintf(stderr,"[LIN] L%d: y_all_rms_AFTER_rmsnorm=%.6f\n", layer, rms_y_after);
     }
 
     /* 8) Output projection: y[BS, nv*vd] -> out[BS, D]
@@ -1950,6 +1978,10 @@ static void qt_from_disk(Model *m, const char *name, int O, int I, int bits, int
         /* Always store as F32 regardless of bits (bits only controls quantization of F32 source) */
         if(!t->qf){ qt_alloc(t,O,I,16); }
         for(int64_t i=0; i<O*I; i++) t->qf[i] = tmp[i];
+        if(!strcmp(name,"model.language_model.layers.0.linear_attn.in_proj_z.weight")){
+            fprintf(stderr,"[INIT] in_proj_z F16->F32: first8=[% .6f % .6f % .6f % .6f % .6f % .6f % .6f % .6f]\n",
+                t->qf[0],t->qf[1],t->qf[2],t->qf[3],t->qf[4],t->qf[5],t->qf[6],t->qf[7]);
+        }
         free(tmp);
         t->fmt = 0;
     } else if(gt->dtype == GGML_TYPE_NVFP4){
@@ -3074,6 +3106,11 @@ static void layer_forward(Model *m, Layer *l, int li, float *x, int S, int pos_b
         
         /* Apply input_layernorm — Qwen3.5 uses (1+weight)/RMSNorm */
         for(int s=0;s<S;s++) rmsnorm_qw35(nrm+(int64_t)s*D, x+(int64_t)s*D, l->in_ln, D, c->eps);
+        if(getenv("DEBUG_LINEAR") && li==0){
+            float rms_out=0; for(int i=0;i<D;i++) rms_out+=nrm[i]*nrm[i];
+            fprintf(stderr,"[LIN] L%d: nrm RMS=%.4f nrm[0:4]=[%.6f %.6f %.6f %.6f]\n",
+                li,sqrtf(rms_out/D),nrm[0],nrm[1],nrm[2],nrm[3]);
+        }
 
         if(is_delta_layer(li,c)){
             /* GatedDeltaNet: projections on LN-normalized input */
@@ -3637,6 +3674,8 @@ static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
         snprintf(tkp,sizeof(tkp),"%s/tokenizer.json",snap);
     }
     /* DEBUG_LAYER: init per-layer JSON dump */
+    fprintf(stderr, "[MAIN] getenv(DEBUG_LAYER)=%s\n", getenv("DEBUG_LAYER") ? getenv("DEBUG_LAYER") : "(null)");
+    fflush(stderr);
     if(getenv("DEBUG_LAYER")) debug_layer_init(prompt);
     Tok T; tok_load(&T,tkp);
     int eos=tok_id_of(&T,"<|endoftext|>");
@@ -3656,6 +3695,7 @@ static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
     int *all=malloc((np+ngen+g_draft+2)*sizeof(int)); memcpy(all,pids,np*sizeof(int));
     double t=now_s();
     float *logit=step(m,pids,np,0);
+    fprintf(stderr, "[STEP_DONE] got logit\n");
     EmitStream es={&T,m,t,0,0};
     grammar_reset();
     int produced=spec_decode(m,all,np,ngen,eos,logit,emit_stream,&es,NULL);

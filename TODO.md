@@ -1,9 +1,11 @@
 # Colibri — Implementation Plan & Current Status
 
-> **Last updated**: 2026-07-16  
+> **Last updated**: 2026-07-22  
 > **Active branch**: `hip-uma-gfx1151`  
 > **Target hardware**: AMD Strix Halo (gfx1151, RDNA4) via ROCm HIP  
 > **Primary model**: Qwen3.5-0.8B (linear attention + GQA)
+>
+> **Session Focus**: Debugging Qwen3.5 linear attention numerical discrepancy
 
 ---
 
@@ -20,8 +22,8 @@
 | **FP4 OCP E2M1** | ✅ CPU + GPU kernels, 40/40 tests |
 | **GGUF v3 parser** | ✅ Loads 488 tensors (F32/F16/NVFP4/NVFP8) |
 | **Safetensors → GGUF converter** | ✅ FP16 (lossless), FP8-E4M3, FP4-E2M1 |
-| **Qwen3.5 end-to-end** | 🟡 **Broken — numerical accuracy** |
-| **Qwen3.5 Linear Attention** | 🟡 Runs but "The!!!!!!!!!" |
+| **Qwen3.5 end-to-end** | 🔴 **Linear attention output 4-400x smaller than PyTorch** |
+| **Qwen3.5 Linear Attention** | 🔴 **attn_out RMS mismatch: C=0.0026 vs PyT=0.0297 (L0)** |
 | **Qwen3.5 GQA** | 🟡 Runs but not matching PyTorch |
 
 ---
@@ -76,10 +78,33 @@
 
 ---
 
-## Phase 8.3: Numerical Accuracy (Current Work)
+## Phase 8.3: Numerical Accuracy (FIXED K Normalization)
 
-### Symptom
-Model runs end-to-end from GGUF FP16 (all 488 tensors loaded). Previously produced "The!!!!!!!!!!!!!!!!!!!!", then "The cat sat fung unit SOVE...", now "The cat sat andre ... HTTP Cair Calabria..." — improving but wrong tokens.
+### Current Status (2026-07-17)
+**post_ln RMS fix verified ✅. Attention output RMS 10-4000× smaller than PyTorch ❌. Generation stuck on token 271 (double newline).**
+
+| Metric | C | PyTorch | Status |
+|---|---|---|---|
+| K RMS (after L2 norm) | 0.0221 | 0.0221 | ✅ FIXED |
+| out_first4 (layer 0) | [-0.3347, 0.0559, -0.0622, -0.0114] | [-0.3347, 0.0559, -0.0622, -0.0114] | ✅ MATCHES |
+| out_rms (layer 0) | 0.0032 | 0.0297 | ⚠️ diverging |
+| **post_ln RMS (layer 0)** | **0.126** | **0.159** | ✅ FIXED (was 1.05) |
+| **post_ln RMS (layer 1)** | **0.187** | **0.189** | ✅ FIXED (was 1.16) |
+
+### Fixes Applied
+1. ✅ **K normalization** — Changed from per-head (dividing by sqrt(sum/128)) to per-row (dividing by sqrt(sum/2048))
+2. ✅ **RMSNormGated** — Changed from per-head normalization to per-row normalization
+3. ✅ **Q normalization** — Same per-row fix applied
+4. ✅ **post_ln weight handling** — `rmsnorm_qw35` now uses raw weight `w[i]` directly (not `1.0f+w[i]`), matching GGUF-stored PyTorch weights. Post-LN RMS: L0 C=0.126 vs PyTorch weight RMS=0.128 ✅
+
+### Symptom (Remaining)
+Model runs end-to-end from GGUF FP16. Layer 0 attention matches PyTorch. **post_ln RMS fix applied — now C and PyTorch agree on LN output magnitudes.**
+- Expected: "on the floor, and the cat sat on the floor."
+- Actual: "The cat sat andre ... HTTP Cair Calabria 过年"
+- Layer 0 post_attn RMS: C=0.003 vs PyTorch=0.032 (diverging from S=1)
+- Layer 1+ post_attn RMS: C and PyTorch differ
+- post_ln RMS fix verified (C now matches PyTorch weight RMS, not 1+w)
+- Debug script at `c/debug_qwen.py` for layer-by-layer comparison
 
 ### PyTorch Reference
 ```
@@ -96,11 +121,11 @@ The cat sat andre ... HTTP Cair Calabria 过年 表述 destinado
 | Metric | C | PyTorch | Status |
 |--------|---|---------|--------|
 | QKV RMS | 1.2901 | 1.2901 | ✅ exact |
-| K norm RMS | 0.0883 | 0.0884 | ✅ |
-| conv1d_out RMS | 0.0964 | 0.1100 | ⚠️ close |
-| post_out RMS | 0.0589 | 0.0377 | ⚠️ different |
+| K norm RMS | 0.0221 | 0.0221 | ✅ FIXED (per-row) |
 | conv1d_out[0] | -0.0612 | -0.0612 | ✅ exact match! |
-| v_raw RMS | 0.0751 | 0.1335 | ❌ off by 2x |
+| **post_ln RMS** | **0.126** | **0.159** | ✅ FIXED (was 1.05) |
+| post_attn_out RMS | 0.0032 | 0.0319 | ⚠️ diverging |
+| layer_out RMS | 0.0180 | 0.1596 | ⚠️ diverging |
 
 ### Recent Fixes
 1. ✅ Conv1d kernel indexing — ti = t - k (commit f56dc25)
@@ -109,9 +134,51 @@ The cat sat andre ... HTTP Cair Calabria 过年 表述 destinado
 4. ✅ A_log/dt_bias — match PyTorch
 5. ✅ Out_proj weights — match PyTorch
 6. ✅ qkv_all matmul — matches PyTorch
+7. ✅ **post_ln RMSNorm weight handling** — Changed from `(1.0f+w[i])` to raw `w[i]`, matching GGUF-stored PyTorch weights
 
-### Remaining Issue
-The conv1d output RMS is close (C=0.096, PyTorch=0.11) but not exact. The first element matches (-0.0612), but subsequent elements differ. This causes downstream differences in V values (C=0.075 vs PyTorch=0.133), leading to wrong attention output.
+### Session 2026-07-22: Linear Attention Output Discrepancy
+
+**New Finding**: The C linear attention output is **4-400x smaller** than PyTorch across all layers.
+
+| Layer | Type | C attn_out RMS | PyTorch out_proj RMS | Ratio |
+|-------|------|----------------|---------------------|-------|
+| L0 | Linear | 0.0026 | 0.0297 | 0.089 |
+| L1 | Linear | 0.00024 | 0.0172 | 0.014 |
+| L2 | Linear | 0.00010 | 0.0194 | 0.005 |
+| L5 | Linear | 0.0115 | 0.1011 | 0.114 |
+| L18 | Linear | 0.0249 | 0.0957 | 0.260 |
+
+**PyTorch Reference (Layer 0)**:
+- y_all_rms (before RMSNormGated): 0.00058
+- y_gated_rms (after RMSNormGated): 0.0699  
+- out_proj_rms: 0.0297
+
+**Suspected Root Causes**:
+1. State update in recurrence may not accumulate correctly
+2. RMSNormGated may be applied incorrectly
+3. Output projection matmul may have wrong weights/layout
+
+**Debug Tools Created**:
+- `c/compare_layers.py`: Layer-by-layer C vs PyTorch comparison
+- `c/compare_linear_exact.py`: Element-by-element linear attention comparison
+- `c/DEBUG_FINDINGS.md`: Detailed debugging findings
+
+**Remaining Issues**:
+1. **Linear attention output**: C=0.0026 vs PyTorch=0.0297 (L0, 11x difference)
+2. **Layer divergence**: Ratio varies from 0.002 to 0.26 across layers
+3. **Conv1d RMS**: C=0.096 vs PyTorch=0.11 — close but not exact
+4. **post_ln fix**: Weight handling corrected, now within 5-10%
+5. **Logits**: Still need to verify after all fixes
+
+### Debug Tools
+- **`c/debug_qwen.py`**: Layer-by-layer PyTorch vs C comparison
+  - `python3 debug_qwen.py` — run PyTorch and save outputs
+  - `python3 debug_qwen.py --compare` — compare with latest C debug file
+  - `python3 debug_qwen.py --check linear` — focus on linear attention layers
+  - `python3 debug_qwen.py --layer 0,1,2` — specific layers
+- **`DEBUG_LAYER=1`**: Per-layer intermediate dump to `debug_layer_*.json`
+- **`DEBUG_LINEAR=1`**: Detailed linear attention debugging (conv1d, QKV, gating)
+- **`REF_FORCE=1`**: Override oracle validation error for real model testing
 
 ---
 
@@ -327,6 +394,13 @@ The conv1d output RMS is close (C=0.096, PyTorch=0.11) but not exact. The first 
 
 - `DEBUG_LAYER=1` — dumps per-layer intermediate tensors to `c/debug_layer_*.json`
 - `DEBUG_LINEAR=1` — dumps detailed linear attention intermediates (conv1d, QKV, gating, state)
+- `c/debug_qwen.py` — **NEW**: Full PyTorch→C layer-by-layer comparison tool
+  - `python3 debug_qwen.py` — run PyTorch and save outputs
+  - `python3 debug_qwen.py --compare` — compare with latest C debug file
+  - `python3 debug_qwen.py --check linear` — focus on linear attention layers only
+  - `python3 debug_qwen.py --check gqa` — focus on GQA layers only
+  - `python3 debug_qwen.py --layer 0,1,2,3` — compare specific layers
+  - `python3 debug_qwen.py --prompt "custom prompt"` — use different prompt
 - `c/pytorch_dump_layers.py` — dumps PyTorch layer outputs and intermediates
 - `c/pytorch_linear_debug.py` — focused linear attention comparison script
 - `c/compare_common.py` — compares C vs PyTorch measurements

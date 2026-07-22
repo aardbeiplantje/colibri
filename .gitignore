@@ -52,3 +52,5 @@ stats*.txt
 **/*.html
 Qwen3.5-0.8B
 c/debug_layer_*.json
+
+*.gguf
