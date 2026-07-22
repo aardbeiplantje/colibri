@@ -401,6 +401,48 @@ disk (GGUF) → mmap() → host_ptr → hipHostRegister → hipHostGetDevicePoin
 
 ---
 
+## Phase 8.6: Qwen3.5 Linear Attention Debugging 🔴 In Progress
+
+### Status (2026-07-22)
+
+**Linear attention output RMS is ~2x smaller than PyTorch.**
+
+| Metric | C | PyTorch | Ratio |
+|---|---|---|---|
+| y_all_rms_BEFORE_rmsnorm | 0.000507 | 0.000583 | 0.87 |
+| y_all_rms_AFTER_rmsnorm | 0.0648 | 0.0699 | 0.93 |
+| out_rms (layer 0) | 0.0180 | 0.0297 | 0.61 |
+| out_first4[0] | -0.156883 | -0.334720 | 0.47 |
+
+### Debug Findings
+
+1. **conv1d**: Matches PyTorch exactly (weights and output)
+2. **QKV projection**: Matches PyTorch (RMS=1.2312)
+3. **K L2 normalization**: Matches PyTorch (RMS=0.0221)
+4. **RMSNormGated**: Close but not exact (0.0648 vs 0.0699)
+5. **Output projection**: 2x difference (0.0180 vs 0.0297)
+
+### Suspected Root Causes
+
+1. **State update computation** — The gated delta rule may have a bug in the K^T @ S or outer product
+2. **Output computation** — The y = Q @ S.T may have a layout issue
+3. **Value head mapping** — The vh = h * nv / nq mapping may be incorrect
+
+### Debug Commands
+
+```bash
+# Run C with linear attention debug
+DEBUG_LAYER=0 DEBUG_LINEAR=1 SNAP="Qwen3.5-0.8B.gguf" PROMPT="The cat sat" NGEN=1 ./c/glm 64 8 8
+
+# Run PyTorch reference
+python3 c/pytorch_linear_debug.py
+
+# Compare outputs
+python3 c/pytorch_linear_debug.py 2>&1 | grep -E "out_rms|out_first"
+```
+
+---
+
 ## Phase 8.4: Next Steps (Recommended Priority Order)
 
 ### P0: Debug K normalization and linear attention recurrence
